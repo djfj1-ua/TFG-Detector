@@ -1,6 +1,13 @@
 #!/bin/bash
 
-INTERFAZ="wlp4s0"
+if [ "$#" -ne 2 ]; then
+    echo "Error: Faltan parámetros."
+    echo "Uso: sudo wifi_mode.sh {monitor|managed} <interfaz>"
+    echo "Ejemplo: sudo wifi_mode.sh monitor wlp4s0"
+    exit 1
+fi
+
+INTERFAZ=$2
 
 if [ "$EUID" -ne 0 ]; then
 	echo "Por favor, ejecuta el script como root."
@@ -19,7 +26,7 @@ case "$1" in monitor)
 	iwconfig | grep -A 1 $INTERFAZ
 	echo "Listo. Interfaz actual: $INTERFAZ"
 	;;
-	managed)
+managed)
 	echo "Restaurando MODO MANAGED en $INTERFAZ"
 	#1. Detener modo monitor
 	airmon-ng stop $INTERFAZ
@@ -33,8 +40,8 @@ case "$1" in monitor)
 	iwconfig | grep -A 1 $INTERFAZ
 	echo "Sistema modo managed."
 	;;
-	*)
-	echo "Uso: sudo $0 {monitor|managed}"
-	exit 1
-	;;
+*)
+echo "Uso: sudo $0 {monitor|managed}"
+exit 1
+;;
 esac
