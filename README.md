@@ -1,4 +1,4 @@
-# 📡 Detector de Fraude Académico vía Wi-Fi (TFG)
+# 📡 Detector de Fraude Académico (TFG)
 
 Este proyecto tiene como objetivo evaluar las tecnologías empleadas actualmente para el fraude en pruebas académicas y el desarrollo de una herramienta capaz de detectar dispositivos sospechosos mediante el análisis del tráfico de la red.
 
