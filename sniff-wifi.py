@@ -1,16 +1,23 @@
 from datetime import datetime
 import os
 import time
+import sys
 import threading
 from scapy.all import sniff
 from scapy.layers.dot11 import Dot11, Dot11ProbeReq
 from manuf import manuf
 
 
-INTERFAZ = "wlp4s0"
 UMBRAL_PROXIMIDAD = -90
 CANALES_PRIORITARIOS = [1, 6, 9]
 mac_parser = manuf.MacParser(update=False)
+
+if len(sys.argv) < 2:
+    print("\nError: Debes especificar la interfaz de red.")
+    print("Uso: sudo python3 sniff-wifi.py <interfaz>")
+    sys.exit(1)
+
+INTERFAZ = sys.argv[1]
 
 dispositivos_vistos = {}
 
@@ -80,7 +87,7 @@ def imprimir_resumen():
     print("\n\n" + "="*50)
     print("Dispositivos detectados.")
     print("="*50)
-    print(f"{'FABRICANTE':<20} | {'DIRECCIÓN MAC':<20} | {'POTENCIA MÁXIMA':<15} | {'ESTADO'}")
+    print(f"{'DIRECCIÓN MAC':<20} | {'FABRICANTE':<20} | {'POTENCIA MÁXIMA':<15} | {'ESTADO'}")
     print("-"*50)
     
     sorted_devs = sorted(dispositivos_vistos.items(), key=lambda x: x[1]['rssi'], reverse=True)
