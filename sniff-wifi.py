@@ -21,7 +21,7 @@ INTERFAZ = sys.argv[1]
 
 dispositivos_vistos = {}
 
-def saltos_canal():
+def saltos_canal(): #Función salto entre canales con prioridad a los canales 1, 6 y 9.
     while True:
         for canal in range (1, 14):
             os.system(f"iwconfig {INTERFAZ} channel {canal}")
