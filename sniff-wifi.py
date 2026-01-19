@@ -41,6 +41,8 @@ def procesar_paquete(pkt):
         es_datos = False
         ssid = "?"
 
+        #Capa RadioTap -> información física
+        #Capa 802.11 -> Campos Type y Subtype
         #Type == 0 -> Encontrar redes(Management)
         #Type == 1 -> Control(ACK)
         #Type == 2 -> Datos
@@ -111,7 +113,7 @@ def iniciar_escaneo():
     hilo_canales.start()
 
     try:
-        sniff(iface=INTERFAZ, prn=procesar_paquete, store=0)
+        sniff(iface=INTERFAZ, prn=procesar_paquete, store=0) #store = 0 -> borra el paquete de la ram para que no le falte memoria.
     except KeyboardInterrupt:
         print("\nDeteniendo el escaneo...")
     except Exception as e:
