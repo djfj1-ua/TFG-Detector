@@ -487,50 +487,33 @@ class BluetoothScanner:
 
     # ── Loop principal ───────────────────────────────────────────────────────
 
-    # Segundos entre Inquiries clásicos.
-    # El Inquiry dura INQUIRY_DURATION × 1.28 s ≈ 5 s (duration=4).
-    # Con INQUIRY_INTERVAL=10 el ciclo es: 5s Inquiry + 5s BLE limpio.
-    # Máxima espera para detectar un Classic BT que entra en discoverable: ~10s.
-    INQUIRY_INTERVAL = 10
-
     def _ble_loop(self):
-        """
-        BLE activo de forma continua; Inquiry clásico periódico cada
-        INQUIRY_INTERVAL segundos. Un dispositivo que aparezca en cualquier
-        momento es detectado en segundos por BLE, sin tener que esperar
-        al final de un ciclo de Inquiry.
-        """
         while self._running.is_set():
             try:
                 sock = self._open_hci_socket()
                 self._enable_ble_scan(sock)
-
-                # Primer Inquiry tras 5 s de BLE limpio
-                next_inquiry = time.time() + 5
-
-                while self._running.is_set():
-                    try:
-                        raw = sock.recv(1024)
-                    except socket.timeout:
-                        if time.time() >= next_inquiry:
-                            sock.send(cmd_inquiry())
-                        continue
-                    except OSError:
-                        break
-
-                    inquiry_done = self._handle_hci_event(raw, sock)
-                    if inquiry_done:
-                        # Inquiry completado → programar el siguiente
-                        next_inquiry = time.time() + self.INQUIRY_INTERVAL
-
+                self._send_hci_cmd(sock, OGF_LINK_CTL, OCF_INQUIRY,
+                                   INQUIRY_LAP + struct.pack('<BB', 8, 0))
+                log.info("BLE scan + Inquiry clásico activados")
+                self._receive_loop(sock)
                 sock.close()
             except PermissionError:
-                log.error("Scanner necesita privilegios root (PermissionError)")
+                log.error("Scanner necesita privilegios root")
                 self._running.clear()
                 break
             except Exception as e:
                 log.warning("Scanner error: %s — reintentando en 3s", e)
                 time.sleep(3)
+
+    def _receive_loop(self, sock: socket.socket):
+        while self._running.is_set():
+            try:
+                raw = sock.recv(1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            self._handle_hci_event(raw, sock)
 
     def _enable_ble_scan(self, sock: socket.socket):
         """Configura y activa el escaneo LE con ventana amplia."""
@@ -550,19 +533,9 @@ class BluetoothScanner:
 
     # ── Parseo de eventos ────────────────────────────────────────────────────
 
-    def _handle_hci_event(self, raw: bytes, sock: socket.socket) -> bool:
-        """
-        Despacha un paquete HCI recibido según su event code.
-        Devuelve True cuando el Inquiry completa (señal para que _receive_loop salga).
-
-        Formato del paquete:
-          [0]  HCI packet type (0x04 = event)
-          [1]  Event code
-          [2]  Parameter total length
-          [3:] Parameters
-        """
+    def _handle_hci_event(self, raw: bytes, sock: socket.socket):
         if len(raw) < 3 or raw[0] != HCI_EVENT_PKT:
-            return False
+            return
 
         event_code = raw[1]
         params     = raw[3:]
@@ -581,9 +554,17 @@ class BluetoothScanner:
                 self._register_classic_device(r)
 
         elif event_code == HCI_EV_INQUIRY_COMPLETE:
-            return True   # señaliza fin del Inquiry → _ble_loop gestionará la pausa
-
-        return False
+            # Pausa de 15s antes del siguiente Inquiry. Durante este tiempo
+            # el hardware sigue recibiendo BLE (los paquetes se encolan en
+            # el buffer del kernel y se procesan al volver al receive loop).
+            time.sleep(15)
+            if not self._running.is_set():
+                return
+            try:
+                self._send_hci_cmd(sock, OGF_LINK_CTL, OCF_INQUIRY,
+                                   INQUIRY_LAP + struct.pack('<BB', 8, 0))
+            except Exception as e:
+                log.warning("Error relanzando inquiry: %s", e)
 
     # ── Registro de dispositivos ─────────────────────────────────────────────
 
