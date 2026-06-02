@@ -194,14 +194,23 @@ impidiendo que el BLE scan reciba advertising packets con regularidad.
 El efecto observado: el RSSI de los dispositivos BLE deja de actualizarse
 y queda congelado en el último valor recibido.
 
-**Solución:** esperar 15 segundos tras cada Inquiry Complete antes de
-relanzar el siguiente. Durante esa pausa, el hardware BLE tiene el radio
-libre y procesa los advertising packets acumulados en el buffer del kernel.
-El ciclo resultante es: ~10s de Inquiry → 15s de BLE limpio → repite.
+**Solución:** usar `threading.Timer` para relanzar el Inquiry 5 segundos
+después de que complete, sin bloquear el receive loop. Durante esos 5s
+el hardware está 100% disponible para BLE. El ciclo resultante es:
+~10s Inquiry → 5s BLE puro → ~10s Inquiry → ...
+
+Un `time.sleep()` directo en `_handle_hci_event` bloquea el único hilo
+que lee del socket — los paquetes BLE llegan al buffer del kernel pero
+nadie los lee, y si el buffer se llena se pierden.
 
 ```python
 elif event_code == HCI_EV_INQUIRY_COMPLETE:
-    time.sleep(15)   # BLE limpio antes del siguiente Inquiry
+    if self._running.is_set():
+        threading.Timer(5.0, self._relaunch_inquiry, args=[sock]).start()
+
+def _relaunch_inquiry(self, sock):
+    if not self._running.is_set():
+        return
     self._send_hci_cmd(sock, OGF_LINK_CTL, OCF_INQUIRY, ...)
 ```
 

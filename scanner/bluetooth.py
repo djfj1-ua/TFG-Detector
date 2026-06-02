@@ -1,114 +1,199 @@
+#!/usr/bin/env python3
 """
-Bluetooth scanner — BLE y Clásico vía raw HCI socket.
-Sin dependencias externas ni subprocess.
+bluetoothPrueba.py — Scanner Bluetooth (BLE + Clásico) para TFG detección fraude académico.
+Raspberry Pi 5, BCM43455, Raspberry Pi OS Bookworm ARM64.
+Sin dependencias externas de Bluetooth. Sockets HCI RAW únicamente.
+DEBUG VERSION — escribe log detallado en /tmp/bt_debug.log
 """
 
 import ctypes
+import os
+import queue
 import socket
 import struct
+import sys
 import threading
-import queue
 import time
-import logging
+import traceback
 from dataclasses import dataclass, field
-from typing import Optional, Callable
+from typing import Callable, Optional
 
-log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constantes HCI
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# DEBUG
+# ──────────────────────────────────────────────────────────────
 
-HCI_COMMAND_PKT = 0x01
-HCI_EVENT_PKT   = 0x04
+_LOG_PATH = '/tmp/bt_debug.log'   # ruta del fichero de log en disco
+_log_lock = threading.Lock()      # mutex para que varios hilos no escriban a la vez
+_t0       = time.time()           # marca de tiempo del arranque, usada para timestamps relativos
 
-# OGF (Opcode Group Field)
-OGF_LINK_CTL = 0x01
-OGF_LE_CTL   = 0x08
 
-# OCF — Link Control
-OCF_INQUIRY = 0x0001
+def _dbg(msg: str) -> None:
+    """
+    Escribe una línea de debug en /tmp/bt_debug.log con timestamp relativo al arranque.
+    Usa un Lock para que sea segura desde múltiples hilos simultáneamente.
+    """
+    # Calcula el tiempo transcurrido desde el arranque del programa
+    ts   = f'{time.time() - _t0:+9.3f}s'
+    line = f'[{ts}] {msg}\n'
 
-# OCF — LE Controller
-OCF_LE_SET_SCAN_PARAMETERS = 0x000B
-OCF_LE_SET_SCAN_ENABLE     = 0x000C
+    # Adquiere el mutex antes de escribir para evitar mezcla de líneas entre hilos
+    with _log_lock:
+        with open(_LOG_PATH, 'a') as f:
+            f.write(line)
 
-# Códigos de evento HCI
-HCI_EVENT_COMMAND_COMPLETE  = 0x0E
-HCI_EV_INQUIRY_COMPLETE     = 0x01
-HCI_EV_INQUIRY_RESULT_RSSI  = 0x22
-HCI_EV_EXTENDED_INQUIRY     = 0x2F
-HCI_EVENT_LE_META           = 0x3E
 
-# Subevento LE Meta
-LE_META_ADVERTISING_REPORT = 0x02
+# Al importar el módulo, borra el log anterior y escribe la cabecera con fecha/hora
+with open(_LOG_PATH, 'w') as _f:
+    _f.write(f'=== bt_debug.log — {time.strftime("%Y-%m-%d %H:%M:%S")} ===\n')
 
-# Tipos de dirección BLE
-BLE_ADDR_PUBLIC = 0x00
-BLE_ADDR_RANDOM = 0x01
 
-# Tipos de evento advertising BLE
-ADV_IND         = 0x00  # connectable undirected
-ADV_DIRECT_IND  = 0x01  # connectable directed
-ADV_SCAN_IND    = 0x02  # scannable undirected
-ADV_NONCONN_IND = 0x03  # non-connectable undirected
-SCAN_RSP        = 0x04  # scan response
+# ──────────────────────────────────────────────────────────────
+# CONSTANTES HCI
+# ──────────────────────────────────────────────────────────────
 
-ADV_TYPE_NAMES = {
-    ADV_IND:         "ADV_IND",
-    ADV_DIRECT_IND:  "ADV_DIRECT_IND",
-    ADV_SCAN_IND:    "ADV_SCAN_IND",
-    ADV_NONCONN_IND: "ADV_NONCONN_IND",
-    SCAN_RSP:        "SCAN_RSP",
+# Tipos de paquete HCI
+HCI_COMMAND_PKT = 0x01   # paquete de comando (host → controlador)
+HCI_EVENT_PKT   = 0x04   # paquete de evento  (controlador → host)
+
+# Códigos de evento HCI que nos interesan
+HCI_EV_INQUIRY_COMPLETE    = 0x01   # fin del período de Inquiry clásico
+HCI_EV_INQUIRY_RESULT_RSSI = 0x22   # respuesta de Inquiry con RSSI (sin nombre)
+HCI_EV_EXTENDED_INQUIRY    = 0x2F   # respuesta de Inquiry extendida (con nombre EIR)
+HCI_EV_LE_META             = 0x3E   # evento contenedor de todos los subeventos BLE
+HCI_LE_EV_ADV_REPORT       = 0x02   # subevent dentro de LE_META: advertising report
+
+# OGF (Opcode Group Field): agrupan comandos por categoría
+OGF_LE_CTL   = 0x08   # grupo de comandos LE Controller
+OGF_LINK_CTL = 0x01   # grupo de comandos Link Control (Inquiry clásico)
+
+# OCF (Opcode Command Field): identifican el comando concreto dentro del OGF
+OCF_LE_SET_SCAN_PARAM  = 0x000B   # configurar parámetros del BLE scan
+OCF_LE_SET_SCAN_ENABLE = 0x000C   # activar o desactivar el BLE scan
+OCF_INQUIRY            = 0x0001   # lanzar un Inquiry Bluetooth clásico
+
+# Mapa de tipos de advertising BLE para mostrar en pantalla
+ADV_TYPES = {
+    0: 'ADV_IND',      # connectable undirected — el más común
+    1: 'ADV_DIRECT',   # connectable directed
+    2: 'ADV_SCAN',     # scannable undirected
+    3: 'ADV_NONCONN',  # non-connectable undirected
+    4: 'SCAN_RSP',     # respuesta a un scan request activo
 }
 
-# LAP para Inquiry General (GIAC)
-INQUIRY_LAP = b'\x33\x8B\x9E'  # 0x9E8B33 en little-endian
+# Códigos de tipo de las estructuras AD/EIR (formato TLV compartido por BLE y Clásico)
+# AD_FLAGS = 0x01  # ← NO UTILIZADO: definido en el estándar pero no se procesa en
+#                  #   _parse_ad_structures; se ignoran los flags de capacidad BLE.
+AD_NAME_SHORT    = 0x08   # nombre abreviado del dispositivo
+AD_NAME_COMPLETE = 0x09   # nombre completo del dispositivo
+AD_TX_POWER      = 0x0A   # potencia de transmisión en dBm
+AD_UUID16_INC    = 0x02   # lista incompleta de UUIDs de 16 bits
+AD_UUID16_COMP   = 0x03   # lista completa de UUIDs de 16 bits
+AD_UUID128_INC   = 0x06   # lista incompleta de UUIDs de 128 bits
+AD_UUID128_COMP  = 0x07   # lista completa de UUIDs de 128 bits
+AD_MANUFACTURER  = 0xFF   # datos específicos del fabricante (company ID + payload)
 
-# AD types (usados tanto en BLE advertising como en EIR clásico)
-AD_FLAGS               = 0x01
-AD_UUID16_INCOMPLETE   = 0x02
-AD_UUID16_COMPLETE     = 0x03
-AD_UUID32_INCOMPLETE   = 0x04
-AD_UUID32_COMPLETE     = 0x05
-AD_UUID128_INCOMPLETE  = 0x06
-AD_UUID128_COMPLETE    = 0x07
-AD_SHORT_NAME          = 0x08
-AD_COMPLETE_NAME       = 0x09
-AD_TX_POWER            = 0x0A
-AD_MANUFACTURER_DATA   = 0xFF
+# Códigos de escape ANSI para colorear la salida en terminal
+RED    = '\033[91m'   # rojo   → dispositivo dentro del aula (RSSI >= -85)
+YELLOW = '\033[93m'   # amarillo → dispositivo cerca         (RSSI >= -95)
+WHITE  = '\033[97m'   # blanco → dispositivo fuera            (RSSI <  -95)
+CYAN   = '\033[96m'   # cian   → cabecera de la tabla
+GREEN  = '\033[92m'   # verde  → estado "hilo vivo" en debug
+RESET  = '\033[0m'    # resetea todos los atributos de color
+BOLD   = '\033[1m'    # negrita
+CLEAR  = '\033[2J\033[H'   # limpia la pantalla y mueve el cursor al inicio
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Dataclass para dispositivos Bluetooth detectados
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# HCI FILTER — ARM64 Bookworm (ctypes nativo)
+# ──────────────────────────────────────────────────────────────
+
+class _KernelHciFilter(ctypes.Structure):
+    """
+    Refleja el struct hci_filter del kernel Linux tal como existe en ARM64.
+    En ARM64 'unsigned long' ocupa 8 bytes, por lo que el struct mide 32 bytes.
+    ctypes calcula el tamaño correcto de forma automática según la plataforma.
+
+    Campos:
+      type_mask  — bitmask de tipos de paquete HCI a dejar pasar
+      event_mask — bitmask de códigos de evento HCI a dejar pasar (2 × 8 bytes)
+      opcode     — filtro opcional por opcode de comando (0 = sin filtro)
+    """
+    _fields_ = [
+        ('type_mask',  ctypes.c_ulong),       # 8 bytes en ARM64
+        ('event_mask', ctypes.c_ulong * 2),   # 16 bytes: dos palabras de 8 bytes
+        ('opcode',     ctypes.c_uint16),      # 2 bytes
+    ]
+
+
+def _build_hci_filter(*event_codes: int) -> bytes:
+    """
+    Construye el binario del struct hci_filter para aplicarlo al socket HCI RAW.
+    Activa los bits correspondientes a cada evento que queremos recibir.
+
+    IMPORTANTE — comportamiento verificado empíricamente en BCM43455 / kernel 6.x ARM64:
+    El kernel usa 'bit = event_code & 31' dentro de event_mask[0] para TODOS los
+    eventos, incluidos los de código >= 32. NO distribuye entre event_mask[0] y [1].
+    Intentar usar event_mask[1] para códigos altos (ej. 0x3E) rompe la recepción BLE.
+    """
+    f = _KernelHciFilter()
+
+    # Activa el bit del tipo HCI_EVENT_PKT (0x04) para recibir eventos del controlador
+    f.type_mask = 1 << HCI_EVENT_PKT
+
+    # Para cada código de evento, calcula el bit y lo activa en event_mask[0]
+    for ev in event_codes:
+        bit = ev & 31   # regla del kernel ARM64: siempre módulo 32, siempre word 0
+        f.event_mask[0] |= 1 << bit
+        _dbg(f'FILTER  ev=0x{ev:02X}  bit={bit}  siempre en word 0')
+
+    # Vuelca los valores finales al log para verificación
+    _dbg(
+        f'FILTER  type_mask=0x{f.type_mask:08X}  '
+        f'event_mask[0]=0x{f.event_mask[0]:016X}  '
+        f'event_mask[1]=0x{f.event_mask[1]:016X}  '
+        f'sizeof={ctypes.sizeof(f)}'
+    )
+
+    # Serializa la estructura a bytes para pasarla a setsockopt
+    return bytes(f)
+
+
+# ──────────────────────────────────────────────────────────────
+# MODELO DE DATOS
+# ──────────────────────────────────────────────────────────────
 
 @dataclass
 class BTDevice:
-    mac: str
-    name: Optional[str]
-    rssi: Optional[int]           # dBm
-    bt_type: str                  # 'BLE' | 'CLASSIC'
-    addr_type: str                # 'public' | 'random' | 'unknown'
-    adv_type: Optional[str]       # ADV_IND, SCAN_RSP, etc. (sólo BLE)
-    manufacturer_id: Optional[int]
-    uuids: list = field(default_factory=list)
-    raw_adv_data: bytes = field(default_factory=bytes)
-    first_seen: float = field(default_factory=time.time)
-    last_seen: float  = field(default_factory=time.time)
-
-    def __post_init__(self):
-        self.mac = self.mac.upper()
-
-    @property
-    def is_random_address(self) -> bool:
-        return self.addr_type == 'random'
+    """
+    Representa un dispositivo Bluetooth detectado (BLE o Clásico).
+    Se actualiza en tiempo real cada vez que se recibe un nuevo paquete del mismo MAC.
+    """
+    mac:             str            # dirección MAC en formato XX:XX:XX:XX:XX:XX mayúsculas
+    name:            Optional[str]  # nombre del dispositivo (None si no se ha anunciado)
+    rssi:            Optional[int]  # potencia de señal recibida en dBm (negativo)
+    bt_type:         str            # 'BLE' o 'CLASSIC'
+    addr_type:       str            # 'public' (fija) o 'random' (rotativa, habitual en BLE)
+    adv_type:        Optional[str]  = None   # tipo de advertising BLE (ADV_IND, SCAN_RSP…)
+    manufacturer_id: Optional[int]  = None   # company ID del fabricante (ej. 0x004C = Apple)
+    uuids:           list           = field(default_factory=list)    # servicios anunciados
+    first_seen:      float          = field(default_factory=time.time)  # primer avistamiento
+    last_seen:       float          = field(default_factory=time.time)  # último avistamiento
 
     @property
     def proximity(self) -> str:
-        """Clasifica la proximidad según RSSI."""
+        """
+        Clasifica la proximidad del dispositivo en tres zonas según el RSSI.
+        Los umbrales están calibrados para un aula estándar con paredes de hormigón.
+
+        Devuelve:
+          'dentro'      — RSSI >= -85 dBm: el dispositivo está en el aula
+          'cerca'       — RSSI >= -95 dBm: está justo fuera o en el pasillo
+          'fuera'       — RSSI <  -95 dBm: está lejos, fuera del perímetro
+          'desconocido' — si aún no se ha recibido ningún RSSI
+        """
         if self.rssi is None:
-            return 'unknown'
+            return 'desconocido'
         if self.rssi >= -85:
             return 'dentro'
         if self.rssi >= -95:
@@ -116,506 +201,844 @@ class BTDevice:
         return 'fuera'
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Parseo de AD structures (BLE advertising y EIR clásico comparten formato)
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# PARSEO AD / EIR
+# ──────────────────────────────────────────────────────────────
 
-def parse_ad_structures(data: bytes) -> dict:
+def _parse_ad_structures(data: bytes) -> dict:
     """
-    Parsea los AD structures (TLV: length, type, value).
-    Usado tanto en payloads BLE como en EIR de Inquiry Clásico.
+    Parsea las estructuras AD (Advertising Data) o EIR (Extended Inquiry Response).
+    Ambos formatos son idénticos: bloques TLV (Type-Length-Value) concatenados.
+
+    Estructura de cada bloque:
+      [0]        length  — número de bytes que siguen (incluye el byte de tipo)
+      [1]        type    — código que identifica qué contiene el bloque
+      [2:length] value   — datos del bloque (length-1 bytes)
+
+    Devuelve un dict con las claves: 'name', 'tx_power', 'uuids', 'manufacturer_id'.
+    Los campos que no aparezcan en los datos quedan como None o lista vacía.
     """
-    result = {
-        'name': None,
-        'flags': None,
-        'tx_power': None,
-        'uuids': [],
+    result: dict = {
+        'uuids':           [],
         'manufacturer_id': None,
-        'manufacturer_data': None,
+        'name':            None,
+        'tx_power':        None,
     }
 
-    offset = 0
-    while offset < len(data):
-        length = data[offset]
+    i = 0
+    while i < len(data):
+        # Lee el byte de longitud del bloque actual
+        length = data[i]
+
+        # Un length=0 indica relleno hasta el final del buffer, se salta
         if length == 0:
-            break
-        offset += 1
-        if offset + length > len(data):
+            i += 1
+            continue
+
+        # Si el bloque se saldría del buffer, los datos están corruptos; se aborta
+        if i + length >= len(data):
             break
 
-        ad_type  = data[offset]
-        ad_value = data[offset + 1: offset + length]
-        offset  += length
+        # Extrae tipo y valor del bloque
+        ad_type  = data[i + 1]
+        ad_value = data[i + 2: i + 1 + length]
 
-        if ad_type in (AD_SHORT_NAME, AD_COMPLETE_NAME):
+        # Avanza el puntero al siguiente bloque
+        i += 1 + length
+
+        # ── Nombre del dispositivo ──────────────────────────────
+        if ad_type in (AD_NAME_SHORT, AD_NAME_COMPLETE):
+            # Decodifica UTF-8 tolerante a errores y elimina nulos de relleno
             try:
-                result['name'] = ad_value.decode('utf-8', errors='replace').rstrip('\x00')
+                result['name'] = ad_value.decode('utf-8', errors='replace').strip('\x00')
             except Exception:
                 pass
 
-        elif ad_type == AD_FLAGS:
-            if ad_value:
-                result['flags'] = ad_value[0]
+        # ── Potencia de transmisión ─────────────────────────────
+        elif ad_type == AD_TX_POWER and len(ad_value) >= 1:
+            # TX Power es un int8 signed (puede ser negativo)
+            result['tx_power'] = struct.unpack('b', ad_value[:1])[0]
 
-        elif ad_type == AD_TX_POWER:
-            if ad_value:
-                result['tx_power'] = struct.unpack_from('b', ad_value, 0)[0]
+        # ── UUIDs de 16 bits ────────────────────────────────────
+        elif ad_type in (AD_UUID16_INC, AD_UUID16_COMP):
+            # Cada UUID ocupa 2 bytes little-endian; se formatean como hex de 4 dígitos
+            for j in range(0, len(ad_value) - 1, 2):
+                uuid16 = struct.unpack_from('<H', ad_value, j)[0]
+                result['uuids'].append(f'{uuid16:04X}')
 
-        elif ad_type in (AD_UUID16_COMPLETE, AD_UUID16_INCOMPLETE):
-            for i in range(0, len(ad_value) - 1, 2):
-                uuid = struct.unpack_from('<H', ad_value, i)[0]
-                result['uuids'].append(f"{uuid:04X}")
+        # ── UUIDs de 128 bits ───────────────────────────────────
+        elif ad_type in (AD_UUID128_INC, AD_UUID128_COMP):
+            # Cada UUID ocupa 16 bytes little-endian; se invierte para obtener big-endian estándar
+            for j in range(0, len(ad_value) - 15, 16):
+                raw = ad_value[j:j + 16][::-1]
+                result['uuids'].append(raw.hex())
 
-        elif ad_type in (AD_UUID32_COMPLETE, AD_UUID32_INCOMPLETE):
-            for i in range(0, len(ad_value) - 3, 4):
-                uuid = struct.unpack_from('<I', ad_value, i)[0]
-                result['uuids'].append(f"{uuid:08X}")
+        # ── Datos del fabricante ────────────────────────────────
+        elif ad_type == AD_MANUFACTURER and len(ad_value) >= 2:
+            # Los primeros 2 bytes son el company ID (ej. 0x004C = Apple, 0x0006 = Microsoft)
+            result['manufacturer_id'] = struct.unpack_from('<H', ad_value)[0]
 
-        elif ad_type == AD_MANUFACTURER_DATA:
-            if len(ad_value) >= 2:
-                result['manufacturer_id'] = struct.unpack_from('<H', ad_value, 0)[0]
-                result['manufacturer_data'] = ad_value[2:].hex()
+        # Nota: AD_FLAGS (0x01) se ignora intencionadamente.
+        # Contiene flags de capacidad BLE (LE General Discoverable, BR/EDR Not Supported…)
+        # que no son relevantes para los objetivos del TFG.
 
     return result
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Construcción de paquetes HCI
-# ──────────────────────────────────────────────────────────────────────────────
-
-class _KernelHciFilter(ctypes.Structure):
+def _mac_from_bytes_le(raw: bytes) -> str:
     """
-    Refleja el struct hci_filter del kernel Linux.
-    En kernels 64-bit (ARM64) 'unsigned long' ocupa 8 bytes → struct de 32 bytes.
-    ctypes calcula el tamaño correcto según la plataforma.
+    Convierte una dirección MAC de 6 bytes en formato little-endian (como llega en HCI)
+    a la cadena legible estándar XX:XX:XX:XX:XX:XX en mayúsculas.
+
+    Ejemplo: b'\\x87\\xbe\\x07\\x3b\\x16\\x40' → '40:16:3B:07:BE:87'
     """
-    _fields_ = [
-        ('type_mask',  ctypes.c_ulong),
-        ('event_mask', ctypes.c_ulong * 2),
-        ('opcode',     ctypes.c_uint16),
-    ]
+    # reversed() invierte el orden de bytes (de little-endian a big-endian)
+    return ':'.join(f'{b:02X}' for b in reversed(raw))
 
 
-def build_hci_filter(ptype: int, *events: int) -> bytes:
+# ──────────────────────────────────────────────────────────────
+# COMANDOS HCI
+# ──────────────────────────────────────────────────────────────
+
+def _hci_cmd(ogf: int, ocf: int, params: bytes = b'') -> bytes:
     """
-    Construye el struct hci_filter con el tamaño nativo del kernel.
-    Acepta múltiples eventos para filtrar simultáneamente.
+    Construye un paquete HCI Command listo para enviar por el socket RAW.
 
-    ptype  : tipo de paquete (HCI_EVENT_PKT = 0x04)
-    events : uno o más códigos de evento HCI a dejar pasar
-
-    Nota de implementación (Pi 5, kernel 6.12 ARM64):
-    El kernel de esta plataforma usa el bit (event & 31) dentro de
-    event_mask[0] para todos los eventos, independientemente del código.
-    Verificado empíricamente: 0x3E→bit30, 0x22→bit2, 0x2F→bit15, 0x01→bit1.
+    Formato del paquete HCI Command:
+      [0]    packet_type  = 0x01 (HCI_COMMAND_PKT)
+      [1:3]  opcode       = (OGF << 10) | OCF, en little-endian
+      [3]    param_length = longitud de los parámetros
+      [4:]   params       = parámetros del comando
     """
-    f = _KernelHciFilter()
-    f.type_mask = 1 << ptype
-    for event in events:
-        f.event_mask[0] |= 1 << (event & 31)
-    f.opcode = 0
-    return bytes(f)
-
-
-def build_hci_cmd(ogf: int, ocf: int, params: bytes = b'') -> bytes:
-    """Construye un HCI Command Packet."""
+    # El opcode combina OGF (6 bits superiores) y OCF (10 bits inferiores)
     opcode = (ogf << 10) | ocf
-    return struct.pack("<BHB", HCI_COMMAND_PKT, opcode, len(params)) + params
+
+    # Empaqueta cabecera + parámetros en un único bytes
+    return struct.pack('<BHB', HCI_COMMAND_PKT, opcode, len(params)) + params
 
 
-def cmd_inquiry() -> bytes:
+def cmd_le_set_scan_params(scan_type: int = 0x01) -> bytes:
     """
-    Construye el comando HCI_Inquiry.
+    Construye el comando HCI_LE_Set_Scan_Parameters (OGF=0x08, OCF=0x000B).
+    Configura cómo se realizará el BLE scan antes de activarlo.
+
+    Parámetros fijados:
+      scan_type     = 0x01 (activo): el adaptador envía SCAN_REQ para obtener SCAN_RSP
+                    = 0x00 (pasivo): solo escucha, no envía nada (menos detectable)
+      interval      = 0x0200 = 512 × 0.625ms = 320ms
+      window        = 0x0200 = 320ms  (igual al intervalo → duty cycle 100%)
+      own_addr_type = 0x00 (dirección pública del adaptador)
+      filter_policy = 0x00 (aceptar todos los dispositivos, sin lista blanca)
+    """
+    # Empaqueta los 7 bytes de parámetros del comando
+    params = struct.pack('<BHHBB', scan_type, 0x0200, 0x0200, 0x00, 0x00)
+    return _hci_cmd(OGF_LE_CTL, OCF_LE_SET_SCAN_PARAM, params)
+
+
+def cmd_le_set_scan_enable(enable: int, filter_dup: int = 0x00) -> bytes:
+    """
+    Construye el comando HCI_LE_Set_Scan_Enable (OGF=0x08, OCF=0x000C).
+    Activa o desactiva el BLE scan previamente configurado.
+
+    Parámetros:
+      enable     = 0x01 activa el scan, 0x00 lo desactiva
+      filter_dup = 0x00 reporta todos los paquetes (incluidos duplicados del mismo MAC)
+                 = 0x01 filtra duplicados (solo reporta la primera vez que ve cada MAC)
+                   Se usa 0x00 para actualizar el RSSI continuamente.
+    """
+    return _hci_cmd(OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE, bytes([enable, filter_dup]))
+
+
+def cmd_inquiry(duration: int = 8) -> bytes:
+    """
+    Construye el comando HCI_Inquiry (OGF=0x01, OCF=0x0001).
+    Inicia el proceso de descubrimiento de dispositivos Bluetooth Clásico (BR/EDR).
+
+    Parámetros:
       LAP           = 0x9E8B33 (GIAC — General Inquiry Access Code)
-      Inquiry_Length = 4  →  4 × 1.28 s ≈ 5.12 s por ciclo
-      Num_Responses  = 0  →  sin límite
+                      Código estándar para discovery general de todos los dispositivos.
+                      Se transmite en little-endian: b'\\x33\\x8B\\x9E'
+      duration      = unidades de 1.28s → duration=8 equivale a ~10.24 segundos
+      num_responses = 0 → sin límite de respuestas
     """
-    params = INQUIRY_LAP + struct.pack('<BB', 4, 0)
-    return build_hci_cmd(OGF_LINK_CTL, OCF_INQUIRY, params)
+    # LAP en little-endian + duration y num_responses como bytes sin signo
+    params = b'\x33\x8B\x9E' + struct.pack('<BB', duration, 0)
+    return _hci_cmd(OGF_LINK_CTL, OCF_INQUIRY, params)
 
 
-def mac_from_bytes(addr: bytes) -> str:
-    """Convierte 6 bytes little-endian a string XX:XX:XX:XX:XX:XX."""
-    return ':'.join(f'{b:02X}' for b in reversed(addr))
+# ──────────────────────────────────────────────────────────────
+# DISPLAY
+# ──────────────────────────────────────────────────────────────
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Parseo de eventos HCI
-# ──────────────────────────────────────────────────────────────────────────────
-
-def parse_le_advertising_report(payload: bytes) -> list[dict]:
+def _signal_bar(rssi: Optional[int], width: int = 8) -> str:
     """
-    Parsea el payload de un LE Advertising Report (subevent 0x02).
-    'payload' empieza DESPUÉS del subevent code.
+    Genera una barra de señal visual de texto usando bloques Unicode.
 
-    Estructura por report:
-      Event_Type  (1B) | Address_Type (1B) | Address (6B) | Data_Length (1B) | Data
-    RSSI (1B signed) al final de cada report.
+    Convierte el RSSI (normalmente entre -100 y -40 dBm) a una barra de
+    caracteres llenos (█) y vacíos (░) proporcional a la potencia de señal.
+    Rango de referencia: -100 dBm = barra vacía, -40 dBm = barra llena.
     """
-    if not payload:
-        return []
+    if rssi is None:
+        # Sin dato de señal, devuelve la barra completamente vacía
+        return '░' * width
 
-    num_reports = payload[0]
-    offset = 1
-    reports = []
+    # Normaliza el RSSI al rango [0.0, 1.0]
+    # -100 dBm → 0.0,  -40 dBm → 1.0  (rango de 60 dBm)
+    normalized = max(0.0, min(1.0, (rssi + 100) / 60.0))
 
-    for _ in range(num_reports):
-        if offset + 9 > len(payload):
-            break
+    # Calcula cuántos bloques llenos corresponden
+    filled = round(normalized * width)
 
-        event_type  = payload[offset]
-        addr_type   = payload[offset + 1]
-        addr_bytes  = payload[offset + 2: offset + 8]
-        data_length = payload[offset + 8]
-        offset += 9
-
-        if offset + data_length > len(payload):
-            break
-
-        adv_data = payload[offset: offset + data_length]
-        offset  += data_length
-
-        ad = parse_ad_structures(adv_data)
-
-        reports.append({
-            'event_type':      event_type,
-            'event_type_name': ADV_TYPE_NAMES.get(event_type, f'UNK_{event_type:#04x}'),
-            'addr_type':       'public' if addr_type == BLE_ADDR_PUBLIC else 'random',
-            'mac':             mac_from_bytes(addr_bytes),
-            'name':            ad['name'],
-            'uuids':           ad['uuids'],
-            'manufacturer_id': ad['manufacturer_id'],
-            'raw_adv_data':    adv_data,
-            'rssi':            None,
-        })
-
-    # RSSI: 1 byte signed al final de cada report (en orden)
-    for r in reports:
-        if offset < len(payload):
-            r['rssi'] = struct.unpack_from('b', payload, offset)[0]
-            offset += 1
-
-    return reports
+    return '█' * filled + '░' * (width - filled)
 
 
-def parse_inquiry_result_rssi(params: bytes) -> list[dict]:
+def _proximity_color(proximity: str) -> str:
     """
-    Parsea el evento HCI_EV_INQUIRY_RESULT_RSSI (0x22).
-
-    Estructura:
-      Num_Responses (1B)
-      Por cada respuesta (15 bytes):
-        BD_ADDR                    (6B, little-endian)
-        Page_Scan_Repetition_Mode  (1B)
-        Reserved                   (2B)
-        Class_of_Device            (3B)
-        Clock_Offset               (2B)
-        RSSI                       (1B, signed)
+    Devuelve el código ANSI de color correspondiente a una zona de proximidad.
+    Rojo = dentro del aula, amarillo = cerca, blanco = fuera.
     """
-    if not params:
-        return []
-
-    num = params[0]
-    results = []
-    ENTRY = 15  # bytes por respuesta
-
-    for i in range(num):
-        offset = 1 + i * ENTRY
-        if offset + ENTRY > len(params):
-            break
-
-        addr_bytes = params[offset:     offset + 6]
-        # page_scan_mode = params[offset + 6]
-        # reserved       = params[offset + 7 : offset + 9]
-        cod        = params[offset + 9:  offset + 12]
-        clock_off  = struct.unpack_from('<H', params, offset + 12)[0]
-        rssi       = struct.unpack_from('b',  params, offset + 14)[0]
-
-        results.append({
-            'mac':          mac_from_bytes(addr_bytes),
-            'cod':          cod.hex(),
-            'clock_offset': clock_off,
-            'rssi':         rssi,
-            'name':         None,
-            'uuids':        [],
-            'manufacturer_id': None,
-        })
-
-    return results
+    return {'dentro': RED, 'cerca': YELLOW, 'fuera': WHITE}.get(proximity, WHITE)
 
 
-def parse_extended_inquiry_result(params: bytes) -> list[dict]:
+def _render_table(devices: list) -> str:
     """
-    Parsea el evento HCI_EV_EXTENDED_INQUIRY (0x2F).
-    Siempre contiene exactamente 1 respuesta.
-
-    Estructura (255 bytes totales):
-      Num_Responses              (1B)  — siempre 1
-      BD_ADDR                    (6B)
-      Page_Scan_Repetition_Mode  (1B)
-      Reserved                   (1B)
-      Class_of_Device            (3B)
-      Clock_Offset               (2B)
-      RSSI                       (1B, signed)
-      Extended_Inquiry_Response  (240B, formato TLV igual que AD structures BLE)
+    Construye la cadena de texto completa de la tabla de dispositivos para la terminal.
+    La tabla se ordena por RSSI descendente (el dispositivo más cercano aparece primero).
+    Cada fila incluye tipo, MAC, RSSI numérico, barra de señal, proximidad,
+    tipo de dirección, nombre y tiempo en segundos desde la última actualización.
     """
-    if len(params) < 255:
-        return []
+    lines = []
 
-    # params[0] = num_responses (siempre 1, no lo usamos)
-    addr_bytes = params[1:7]
-    # page_scan  = params[7]
-    # reserved   = params[8]
-    cod        = params[9:12]
-    clock_off  = struct.unpack_from('<H', params, 12)[0]
-    rssi       = struct.unpack_from('b',  params, 14)[0]
-    eir        = params[15:255]   # 240 bytes de EIR data
+    # Cabecera con los nombres de columna en negrita y cian
+    lines.append(
+        f"{BOLD}{CYAN}{'TIPO':<8} {'MAC':<19} {'RSSI':>5}  {'SEÑAL':<10} "
+        f"{'PROX':<12} {'DIR':<9} NOMBRE{RESET}"
+    )
+    lines.append('─' * 80)
 
-    ad = parse_ad_structures(eir)
+    # Ordena los dispositivos de mayor a menor RSSI (más cercano primero)
+    # Los dispositivos sin RSSI se colocan al final con valor ficticio -999
+    for dev in sorted(devices, key=lambda d: d.rssi if d.rssi is not None else -999, reverse=True):
+        color    = _proximity_color(dev.proximity)
+        bar      = _signal_bar(dev.rssi)
+        rssi_str = f'{dev.rssi:+4d}' if dev.rssi is not None else '  N/A'
+        name     = (dev.name or '')[:24]   # trunca el nombre a 24 caracteres
 
-    return [{
-        'mac':             mac_from_bytes(addr_bytes),
-        'cod':             cod.hex(),
-        'clock_offset':    clock_off,
-        'rssi':            rssi,
-        'name':            ad['name'],
-        'uuids':           ad['uuids'],
-        'manufacturer_id': ad['manufacturer_id'],
-    }]
+        # Tiempo en segundos desde que se recibió el último paquete de este dispositivo
+        age = int(time.time() - dev.last_seen)
+
+        lines.append(
+            f"{color}{dev.bt_type:<8} {dev.mac:<19} {rssi_str}  {bar:<10} "
+            f"{dev.proximity:<12} {dev.addr_type:<9} {name}  [{age}s]{RESET}"
+        )
+
+    return '\n'.join(lines)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Scanner principal
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# SCANNER PRINCIPAL
+# ──────────────────────────────────────────────────────────────
 
 class BluetoothScanner:
     """
-    Escanea BLE y Bluetooth Clásico en un único hilo vía raw HCI socket.
+    Scanner Bluetooth que detecta dispositivos BLE y Clásico simultáneamente
+    usando un único socket HCI RAW y un único hilo de captura.
 
-    BLE    → LE Advertising Reports continuos.
-    Clásico → HCI Inquiry cíclico con RSSI y EIR; se relanza automáticamente
-              al recibir el evento Inquiry_Complete.
-
-    Uso:
-        scanner = BluetoothScanner(dev_id=0, on_device=callback)
+    Uso básico:
+        scanner = BluetoothScanner()
         scanner.start()
-        time.sleep(60)
+        # ... leer scanner.devices periódicamente ...
         scanner.stop()
     """
 
-    def __init__(
-        self,
-        dev_id: int = 0,
-        on_device: Optional[Callable[[BTDevice], None]] = None,
-        ble_scan_type: int = 0x00,   # 0=pasivo, 1=activo
-    ):
-        self.dev_id       = dev_id
-        self.on_device    = on_device
-        self.ble_scan_type = ble_scan_type
+    def __init__(self, scan_type: int = 1, on_device: Optional[Callable[[BTDevice], None]] = None):
+        """
+        Inicializa el scanner sin arrancarlo todavía.
 
+        Parámetros:
+          scan_type  — tipo de BLE scan: 1=activo (envía SCAN_REQ), 0=pasivo
+          on_device  — callback opcional llamado cada vez que se detecta un dispositivo nuevo
+        """
+        self._scan_type  = scan_type    # 0=pasivo, 1=activo
+        self.on_device   = on_device    # callback externo para nuevos dispositivos
+
+        # Diccionario de dispositivos detectados, indexado por MAC
+        self._seen: dict[str, BTDevice] = {}
+        self._lock = threading.Lock()   # protege _seen contra accesos concurrentes
+
+        # Cola para desacoplar la detección (hilo HCI) del callback (hilo dispatch)
+        self._event_queue: queue.Queue = queue.Queue()
+
+        # Evento de control de ciclo de vida: set=corriendo, clear=parar
         self._running = threading.Event()
 
-        # Caché de dispositivos vistos: mac → BTDevice
-        self._seen: dict[str, BTDevice] = {}
-        self._seen_lock = threading.Lock()
+        # Referencias a los hilos para poder inspeccionarlos si hace falta
+        self._ble_thread:  Optional[threading.Thread] = None
+        self._disp_thread: Optional[threading.Thread] = None
 
-        # Cola interna para desacoplar detección de callback
-        self._event_queue: queue.Queue[BTDevice] = queue.Queue()
+        # Referencia al timer del Inquiry para poder cancelarlo en stop()
+        self._inquiry_timer: Optional[threading.Timer] = None
 
-    # ── Ciclo de vida ────────────────────────────────────────────────────────
+        # ── Contadores de debug ────────────────────────────────
+        self.dbg_recv_total   = 0       # total de paquetes HCI recibidos
+        self.dbg_ble_reports  = 0       # LE Advertising Reports procesados
+        self.dbg_inq_results  = 0       # respuestas de Inquiry procesadas
+        self.dbg_inq_complete = 0       # eventos INQUIRY_COMPLETE recibidos (esperado: 0)
+        self.dbg_unknown_ev   = 0       # eventos no reconocidos que pasaron el filtro
+        self.dbg_oserror      = 0       # errores OSError en el recv loop
+        self.dbg_loop_alive   = False   # True mientras _ble_loop está ejecutándose
+        self.dbg_last_ev_code = 0       # código del último evento HCI recibido
+        self.dbg_last_ev_ts   = 0.0     # timestamp del último evento recibido
+        self._dbg_lock        = threading.Lock()   # protege los contadores de debug
 
-    def start(self):
-        if self._running.is_set():
-            return
+    def _inc(self, attr: str, delta: int = 1) -> None:
+        """
+        Incrementa un contador de debug de forma thread-safe.
+        Usa setattr/getattr para poder referirse al contador por nombre de cadena.
+        """
+        with self._dbg_lock:
+            setattr(self, attr, getattr(self, attr) + delta)
+
+    # ── API pública ────────────────────────────────────────────
+
+    def start(self) -> None:
+        """
+        Arranca el scanner lanzando los dos hilos daemon:
+          - ble-loop:  captura y parsea eventos HCI del socket RAW
+          - dispatch:  entrega BTDevice nuevos al callback on_device
+        Los hilos son daemon para que mueran solos si el proceso principal termina.
+        """
+        _dbg('SCANNER start()')
+
+        # Activa el Event de control; los bucles while de los hilos lo comprueban
         self._running.set()
 
-        threading.Thread(target=self._ble_loop,     name="bt-scanner",    daemon=True).start()
-        threading.Thread(target=self._dispatch_loop, name="bt-dispatcher", daemon=True).start()
-        log.info("BluetoothScanner iniciado (hci%d)", self.dev_id)
+        # Crea y arranca el hilo de captura HCI
+        self._ble_thread = threading.Thread(
+            target=self._ble_loop, daemon=True, name='ble-loop'
+        )
+        # Crea y arranca el hilo de entrega de callbacks
+        self._disp_thread = threading.Thread(
+            target=self._dispatch_loop, daemon=True, name='dispatch'
+        )
 
-    def stop(self):
+        self._ble_thread.start()
+        self._disp_thread.start()
+
+    def stop(self) -> None:
+        """
+        Detiene el scanner de forma ordenada:
+          1. Limpia el Event → los bucles while de los hilos salen en su próxima iteración
+          2. Cancela el timer del Inquiry si estaba pendiente de disparar
+        El socket y los hilos se limpian solos al salir de sus bucles.
+        """
+        _dbg('SCANNER stop()')
+
+        # Señaliza a todos los hilos que deben terminar
         self._running.clear()
-        self._send_disable_scan()
-        log.info("BluetoothScanner detenido")
+
+        # Cancela el timer para evitar que relance el Inquiry después de stop()
+        if self._inquiry_timer is not None:
+            self._inquiry_timer.cancel()
 
     @property
-    def devices(self) -> list[BTDevice]:
-        with self._seen_lock:
+    def devices(self) -> list:
+        """
+        Devuelve una copia de la lista de dispositivos detectados hasta el momento.
+        Usa el Lock para garantizar consistencia aunque _ble_loop esté actualizando _seen.
+        """
+        with self._lock:
             return list(self._seen.values())
 
-    # ── Socket HCI ───────────────────────────────────────────────────────────
+    # ── Hilo único de captura ──────────────────────────────────
 
-    def _open_hci_socket(self) -> socket.socket:
+    def _ble_loop(self) -> None:
         """
-        Abre un raw HCI socket filtrado para recibir:
-          - LE Meta Events (BLE advertising)
-          - Inquiry Result with RSSI (BT clásico)
-          - Extended Inquiry Result (BT clásico con EIR)
-          - Inquiry Complete (para relanzar el inquiry)
+        Hilo principal de captura. Es el único que lee del socket HCI RAW.
+        Abre el socket, configura el filtro, activa el BLE scan, lanza el primer
+        Inquiry y luego entra en un bucle recv() indefinido hasta que stop() se llame.
+
+        En caso de excepción no recuperable, loguea el traceback completo y termina.
+        El bloque finally garantiza que el socket se cierra siempre.
         """
-        sock = socket.socket(
-            socket.AF_BLUETOOTH,
-            socket.SOCK_RAW,
-            socket.BTPROTO_HCI,
-        )
-        sock.bind((self.dev_id,))
-        sock.settimeout(2.0)
-
-        hci_filter = build_hci_filter(
-            HCI_EVENT_PKT,
-            HCI_EVENT_LE_META,
-            HCI_EV_INQUIRY_RESULT_RSSI,
-            HCI_EV_EXTENDED_INQUIRY,
-            HCI_EV_INQUIRY_COMPLETE,
-        )
-        sock.setsockopt(socket.SOL_HCI, socket.HCI_FILTER, hci_filter)
-        return sock
-
-    def _send_hci_cmd(self, sock: socket.socket, ogf: int, ocf: int, params: bytes = b''):
-        cmd = build_hci_cmd(ogf, ocf, params)
-        sock.send(cmd)
-
-    def _send_disable_scan(self):
-        """Desactiva el BLE scan al parar — lanza su propio socket temporal."""
+        _dbg('BLE_LOOP start')
+        self.dbg_loop_alive = True
         try:
-            sock = self._open_hci_socket()
-            self._send_hci_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
-                               struct.pack("<BB", 0x00, 0x00))
-            sock.close()
-        except Exception:
-            pass
+            # Abre un socket HCI RAW en la familia AF_BLUETOOTH
+            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
 
-    # ── Loop principal ───────────────────────────────────────────────────────
+            # Lo asocia a hci0 (el adaptador BCM43455 de la Raspberry Pi 5)
+            sock.bind((0,))
+            _dbg('BLE_LOOP socket creado y ligado a hci0')
 
-    def _ble_loop(self):
-        while self._running.is_set():
+            # Construye el filtro HCI para recibir solo los eventos que nos interesan
+            # NOTA: HCI_EV_INQUIRY_COMPLETE se incluye en el filtro por completitud,
+            # pero en la práctica NUNCA llega al socket compartido con BLE en el BCM43455.
+            # El ciclo del Inquiry se gestiona mediante un timer temporal en _launch_inquiry.
+            filt = _build_hci_filter(
+                HCI_EV_LE_META,              # advertising BLE
+                HCI_EV_INQUIRY_RESULT_RSSI,  # respuesta Inquiry con RSSI (sin nombre)
+                HCI_EV_EXTENDED_INQUIRY,     # respuesta Inquiry extendida (con nombre)
+                HCI_EV_INQUIRY_COMPLETE,     # fin del Inquiry (no llega, pero se filtra)
+            )
+            sock.setsockopt(socket.SOL_HCI, socket.HCI_FILTER, filt)
+            _dbg('BLE_LOOP filtro HCI aplicado')
+
+            # Activa el BLE scan (una sola vez; nunca se desactiva durante el scan normal)
+            self._enable_ble_scan(sock)
+            _dbg('BLE_LOOP BLE scan activado')
+
+            # Lanza el primer Inquiry clásico e inicia su timer temporal
+            self._launch_inquiry(sock)
+            _dbg('BLE_LOOP primer Inquiry lanzado')
+
+            # Configura el timeout del recv para que el bucle pueda comprobar _running
+            # aunque no lleguen eventos (evita bloquearse indefinidamente)
+            sock.settimeout(1.0)
+
+            # ── Bucle principal de recepción ───────────────────
+            while self._running.is_set():
+                try:
+                    # Bloquea hasta recibir un paquete HCI o hasta el timeout de 1s
+                    raw = sock.recv(4096)
+
+                    # Actualiza los contadores y el timestamp del último evento
+                    self._inc('dbg_recv_total')
+                    with self._dbg_lock:
+                        self.dbg_last_ev_code = raw[1] if len(raw) > 1 else 0
+                        self.dbg_last_ev_ts   = time.time()
+
+                    # Despacha el paquete al manejador de eventos
+                    self._handle_hci_event(raw, sock)
+
+                except socket.timeout:
+                    # El timeout de 1s expiró sin datos: vuelve a comprobar _running
+                    continue
+
+                except OSError as e:
+                    # Error de sistema en el recv (p.ej. EBADF si el socket se cerró)
+                    # Se loguea pero NO se hace break; se intenta continuar
+                    self._inc('dbg_oserror')
+                    _dbg(f'BLE_LOOP OSError en recv: {e!r}')
+                    _dbg(traceback.format_exc())
+                    continue
+
+                except Exception as e:
+                    # Cualquier otra excepción inesperada: se loguea y se continúa
+                    _dbg(f'BLE_LOOP excepción inesperada: {e!r}')
+                    _dbg(traceback.format_exc())
+                    continue
+
+            _dbg('BLE_LOOP while salió (_running cleared)')
+
+        except Exception as e:
+            # Error fatal durante la apertura o configuración del socket
+            _dbg(f'BLE_LOOP CRASH FATAL: {e!r}')
+            _dbg(traceback.format_exc())
+
+        finally:
+            # Se ejecuta siempre, tanto en salida normal como por excepción
+            self.dbg_loop_alive = False
+            _dbg('BLE_LOOP terminado')
+
+            # Intenta desactivar el BLE scan antes de cerrar
             try:
-                sock = self._open_hci_socket()
-                self._enable_ble_scan(sock)
-                self._send_hci_cmd(sock, OGF_LINK_CTL, OCF_INQUIRY,
-                                   INQUIRY_LAP + struct.pack('<BB', 8, 0))
-                log.info("BLE scan + Inquiry clásico activados")
-                self._receive_loop(sock)
+                sock.send(cmd_le_set_scan_enable(0))
+            except Exception:
+                pass
+
+            # Cierra el socket para liberar el recurso del kernel
+            try:
                 sock.close()
-            except PermissionError:
-                log.error("Scanner necesita privilegios root")
-                self._running.clear()
-                break
-            except Exception as e:
-                log.warning("Scanner error: %s — reintentando en 3s", e)
-                time.sleep(3)
+            except Exception:
+                pass
 
-    def _receive_loop(self, sock: socket.socket):
-        while self._running.is_set():
-            try:
-                raw = sock.recv(1024)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            self._handle_hci_event(raw, sock)
+    # ── Gestión BLE scan ───────────────────────────────────────
 
-    def _enable_ble_scan(self, sock: socket.socket):
-        """Configura y activa el escaneo LE con ventana amplia."""
-        params = struct.pack(
-            "<BHHBB",
-            self.ble_scan_type,  # LE_Scan_Type: 0=pasivo, 1=activo
-            0x0200,              # LE_Scan_Interval: 320 ms  (0x0200 × 0.625 ms)
-            0x0200,              # LE_Scan_Window:   320 ms  (duty cycle 100%)
-            0x00,                # Own_Address_Type: public
-            0x00,                # Scanning_Filter_Policy: aceptar todo
-        )
-        self._send_hci_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_PARAMETERS, params)
+    def _enable_ble_scan(self, sock: socket.socket) -> None:
+        """
+        Envía al adaptador los dos comandos necesarios para activar el BLE scan:
+          1. HCI_LE_Set_Scan_Parameters — configura tipo, intervalo y ventana
+          2. HCI_LE_Set_Scan_Enable     — activa el scan con los parámetros anteriores
+        El sleep de 50ms entre ambos da tiempo al firmware a procesar el primero.
+        """
+        # Envía los parámetros (scan_type viene del constructor: 1=activo)
+        sock.send(cmd_le_set_scan_params(self._scan_type))
+
+        # Pausa breve para que el firmware procese los parámetros antes del enable
         time.sleep(0.05)
-        self._send_hci_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
-                           struct.pack("<BB", 0x01, 0x00))  # enable, sin filtrar duplicados
 
+        # Activa el scan; filter_dup=0 para recibir todos los paquetes (RSSI actualizado)
+        sock.send(cmd_le_set_scan_enable(1, filter_dup=0))
+        _dbg('_enable_ble_scan enviado')
 
-    # ── Parseo de eventos ────────────────────────────────────────────────────
+    def _disable_ble_scan(self, sock: socket.socket) -> None:
+        """
+        Desactiva el BLE scan enviando HCI_LE_Set_Scan_Enable con enable=0.
+        Se usa exclusivamente en _on_inquiry_done para hacer el reset del firmware
+        BCM43455, que entra en estado silencioso al terminar el Inquiry.
+        El sleep de 100ms da tiempo al firmware a procesar el disable.
+        """
+        try:
+            sock.send(cmd_le_set_scan_enable(0))
+        except OSError as e:
+            # Si el socket ya estuviera cerrado, se loguea y se continúa
+            _dbg(f'_disable_ble_scan OSError: {e!r}')
 
-    def _handle_hci_event(self, raw: bytes, sock: socket.socket):
-        if len(raw) < 3 or raw[0] != HCI_EVENT_PKT:
+        # Pausa para que el firmware complete el apagado del scan antes del re-enable
+        time.sleep(0.1)
+        _dbg('_disable_ble_scan enviado')
+
+    # ── Gestión Inquiry ────────────────────────────────────────
+
+    def _launch_inquiry(self, sock: socket.socket) -> None:
+        """
+        Envía el comando HCI_Inquiry al adaptador e inicia el timer temporal
+        que detectará cuándo ha terminado.
+
+        Por qué un timer y no el evento HCI_EV_INQUIRY_COMPLETE:
+        En el BCM43455 con socket compartido BLE+Clásico, el evento INQUIRY_COMPLETE
+        nunca llega al proceso. En su lugar se usa un timer basado en la duración
+        conocida del Inquiry: 8 × 1.28s + 0.5s de margen = 10.74s.
+        """
+        # Si ya se ha pedido parar, no lanza nada
+        if not self._running.is_set():
             return
 
-        event_code = raw[1]
-        params     = raw[3:]
+        try:
+            # Envía el comando Inquiry con duración 8 (≈ 10.24 segundos)
+            sock.send(cmd_inquiry(duration=8))
+            _dbg('_launch_inquiry Inquiry enviado')
+        except OSError as e:
+            # Si el socket falla al enviar, no tiene sentido iniciar el timer
+            _dbg(f'_launch_inquiry OSError: {e!r}')
+            return
 
-        if event_code == HCI_EVENT_LE_META:
-            if len(raw) >= 4 and raw[3] == LE_META_ADVERTISING_REPORT:
-                for r in parse_le_advertising_report(raw[4:]):
-                    self._register_ble_device(r)
+        # Inicia el timer que disparará _on_inquiry_done cuando el Inquiry deba haber terminado
+        self._inquiry_timer = threading.Timer(10.74, self._on_inquiry_done, args=[sock])
+        self._inquiry_timer.daemon = True
+        self._inquiry_timer.start()
+        _dbg('_launch_inquiry timer 10.74s iniciado')
 
-        elif event_code == HCI_EV_INQUIRY_RESULT_RSSI:
-            for r in parse_inquiry_result_rssi(params):
-                self._register_classic_device(r)
+    def _on_inquiry_done(self, sock: socket.socket) -> None:
+        """
+        Callback del timer: se ejecuta ~10.74s después de lanzar el Inquiry.
 
-        elif event_code == HCI_EV_EXTENDED_INQUIRY:
-            for r in parse_extended_inquiry_result(params):
-                self._register_classic_device(r)
+        Realiza el ciclo de recuperación del firmware BCM43455:
+          1. Desactiva el BLE scan  → el firmware sale del estado silencioso
+          2. Reactiva el BLE scan   → el adaptador vuelve a emitir advertising reports
+          3. Espera 5s de BLE puro  → timer para lanzar el siguiente Inquiry
 
-        elif event_code == HCI_EV_INQUIRY_COMPLETE:
-            # Pausa de 15s antes del siguiente Inquiry. Durante este tiempo
-            # el hardware sigue recibiendo BLE (los paquetes se encolan en
-            # el buffer del kernel y se procesan al volver al receive loop).
-            time.sleep(15)
-            if not self._running.is_set():
-                return
-            try:
-                self._send_hci_cmd(sock, OGF_LINK_CTL, OCF_INQUIRY,
-                                   INQUIRY_LAP + struct.pack('<BB', 8, 0))
-            except Exception as e:
-                log.warning("Error relanzando inquiry: %s", e)
+        Por qué es necesario el reset BLE:
+        Verificado empíricamente: al terminar el Inquiry, el BCM43455 deja de emitir
+        CUALQUIER evento HCI (incluidos los BLE advertising reports) hasta que se
+        realice este ciclo disable+enable. Sin él, el scanner queda mudo indefinidamente.
+        """
+        _dbg('_on_inquiry_done disparado')
 
-    # ── Registro de dispositivos ─────────────────────────────────────────────
+        # Si se ha pedido parar entre que se lanzó el timer y ahora, no hace nada
+        if not self._running.is_set():
+            _dbg('_on_inquiry_done abortado (_running cleared)')
+            return
 
-    def _register_ble_device(self, report: dict):
+        # Paso 1: desactiva el BLE scan para "despertar" el firmware del estado silencioso
+        self._disable_ble_scan(sock)
+
+        # Paso 2: reactiva el BLE scan → el adaptador vuelve a emitir eventos normalmente
+        self._enable_ble_scan(sock)
+        _dbg('_on_inquiry_done BLE reset completado — esperando 5s para próximo Inquiry')
+
+        # Paso 3: espera 5s de BLE puro antes de lanzar el siguiente Inquiry
+        # Esto da tiempo a recibir advertising reports sin la interferencia del Inquiry
+        self._inquiry_timer = threading.Timer(5.0, self._launch_inquiry, args=[sock])
+        self._inquiry_timer.daemon = True
+        self._inquiry_timer.start()
+
+    # ── Dispatch de eventos HCI ────────────────────────────────
+
+    def _handle_hci_event(self, raw: bytes, sock: socket.socket) -> None:
+        """
+        Punto de entrada de todos los paquetes HCI recibidos del socket.
+        Valida la cabecera, identifica el tipo de evento y delega al parser específico.
+        """
+        # Descarta paquetes demasiado cortos para tener cabecera HCI válida
+        if len(raw) < 3:
+            _dbg(f'EVENT paquete demasiado corto: {raw.hex()}')
+            return
+
+        # El primer byte debe ser siempre HCI_EVENT_PKT (0x04)
+        if raw[0] != HCI_EVENT_PKT:
+            _dbg(f'EVENT tipo inesperado: 0x{raw[0]:02X}  raw={raw[:8].hex()}')
+            return
+
+        # Extrae el código de evento y la longitud declarada de parámetros
+        ev_code = raw[1]
+        plen    = raw[2]
+        _dbg(f'EVENT  code=0x{ev_code:02X}  plen={plen}  raw={raw[:min(len(raw), 12)].hex()}')
+
+        # ── BLE Advertising Report (0x3E) ──────────────────────
+        if ev_code == HCI_EV_LE_META:
+            # Los eventos LE Meta llevan un subevent en el cuarto byte
+            subevent = raw[3] if len(raw) >= 4 else 0xFF
+            _dbg(f'  LE_META  subevent=0x{subevent:02X}')
+            if subevent == HCI_LE_EV_ADV_REPORT:
+                self._inc('dbg_ble_reports')
+                # El payload del advertising report empieza en raw[4] (después del subevent)
+                self._parse_ble_adv_report(raw[4:])
+
+        # ── Inquiry Result con RSSI (0x22) ─────────────────────
+        elif ev_code == HCI_EV_INQUIRY_RESULT_RSSI:
+            num = raw[3] if len(raw) > 3 else 0
+            _dbg(f'  INQUIRY_RESULT_RSSI  num_responses={num}')
+            self._inc('dbg_inq_results')
+            # Los parámetros empiezan en raw[3] (después de type+code+plen)
+            self._parse_inquiry_rssi(raw[3:])
+
+        # ── Extended Inquiry Result (0x2F) ─────────────────────
+        elif ev_code == HCI_EV_EXTENDED_INQUIRY:
+            _dbg(f'  EXTENDED_INQUIRY_RESULT')
+            self._inc('dbg_inq_results')
+            self._parse_extended_inquiry(raw[3:])
+
+        # ── Inquiry Complete (0x01) ─────────────────────────────
+        elif ev_code == HCI_EV_INQUIRY_COMPLETE:
+            # Solo se registra en el log y en el contador.
+            # Este evento NO llega al socket compartido BLE+Clásico en el BCM43455,
+            # por lo que nunca actúa como trigger. El ciclo se gestiona en _launch_inquiry.
+            status = raw[3] if len(raw) > 3 else 0xFF
+            _dbg(f'  INQUIRY_COMPLETE  status=0x{status:02X}  (inesperado en socket compartido)')
+            self._inc('dbg_inq_complete')
+
+        # ── Evento desconocido ──────────────────────────────────
+        else:
+            # Un evento que pasó el filtro HCI pero no está en ninguna rama conocida
+            _dbg(f'  EVENTO NO FILTRADO  code=0x{ev_code:02X} (llegó igualmente al socket)')
+            self._inc('dbg_unknown_ev')
+
+    # ── MÉTODO NO UTILIZADO ────────────────────────────────────
+    # _relaunch_inquiry_unused fue el diseño original donde el Inquiry se relanzaba
+    # directamente al recibir INQUIRY_COMPLETE. Se descartó porque ese evento no llega
+    # al socket compartido con BLE en el BCM43455. Fue reemplazado por el timer temporal
+    # en _launch_inquiry + _on_inquiry_done. Se mantiene como referencia histórica.
+    #
+    # def _relaunch_inquiry_unused(self, sock):
+    #     if not self._running.is_set():
+    #         return
+    #     sock.send(cmd_inquiry(duration=8))
+
+    # ── Parseo BLE Advertising Report ─────────────────────────
+
+    def _parse_ble_adv_report(self, payload: bytes) -> None:
+        """
+        Parsea el payload de un LE Advertising Report (subevent 0x02 del evento 0x3E).
+        Un solo paquete puede contener varios reports consecutivos del mismo barrido.
+
+        Estructura del payload (empieza después del subevent byte):
+          [0]          num_reports — cuántos reports vienen en este paquete
+          Por cada report:
+            [0]        event_type  — tipo de advertising (ADV_IND, SCAN_RSP…)
+            [1]        addr_type   — 0=público, 1=aleatorio
+            [2:8]      MAC         — dirección en little-endian (6 bytes)
+            [8]        data_length — longitud de los AD structures que siguen
+            [9:9+N]    AD data     — N bytes de estructuras TLV
+            [9+N]      RSSI        — int8 signed (último byte del report)
+        """
+        if not payload:
+            return
+
+        # Número de reports incluidos en este paquete
+        num_reports = payload[0]
+        _dbg(f'    ADV_REPORT  num={num_reports}')
+
+        offset = 1   # puntero al inicio del primer report
+        for i in range(num_reports):
+            # Comprueba que quedan al menos 9 bytes para leer la cabecera del report
+            if offset + 9 > len(payload):
+                _dbg(f'    ADV_REPORT[{i}] truncado en offset={offset}')
+                break
+
+            # Lee los campos fijos de la cabecera del report
+            event_type = payload[offset]
+            addr_type  = payload[offset + 1]
+            mac_raw    = payload[offset + 2: offset + 8]
+            data_len   = payload[offset + 8]
+            offset    += 9   # avanza más allá de la cabecera
+
+            # Comprueba que quedan suficientes bytes para los AD structures
+            if offset + data_len > len(payload):
+                _dbg(f'    ADV_REPORT[{i}] data truncada data_len={data_len}')
+                break
+
+            # Extrae los AD structures y avanza el puntero
+            ad_data = payload[offset: offset + data_len]
+            offset += data_len
+
+            # El RSSI es el byte inmediatamente después de los AD structures (int8 signed)
+            rssi: Optional[int] = None
+            if offset < len(payload):
+                rssi = struct.unpack('b', bytes([payload[offset]]))[0]
+                offset += 1
+
+            # Convierte los bytes de MAC a string legible
+            mac    = _mac_from_bytes_le(mac_raw)
+            # Parsea los AD structures para extraer nombre, UUIDs, etc.
+            parsed = _parse_ad_structures(ad_data)
+
+            _dbg(
+                f'    ADV_REPORT[{i}]  mac={mac}  rssi={rssi}  '
+                f'type={ADV_TYPES.get(event_type, "??")}  name={parsed.get("name")!r}'
+            )
+
+            # Construye el dict de report y lo registra en el caché de dispositivos
+            report = {
+                'mac':             mac,
+                'rssi':            rssi,
+                'bt_type':         'BLE',
+                'addr_type':       'random' if addr_type else 'public',
+                'adv_type':        ADV_TYPES.get(event_type),
+                'name':            parsed.get('name'),
+                'manufacturer_id': parsed.get('manufacturer_id'),
+                'uuids':           parsed.get('uuids', []),
+            }
+            self._register_ble_device(report)
+
+    # ── Parseo Inquiry Result with RSSI (0x22) ─────────────────
+
+    def _parse_inquiry_rssi(self, payload: bytes) -> None:
+        """
+        Parsea el evento HCI_EV_INQUIRY_RESULT_RSSI (0x22).
+        Contiene respuestas de dispositivos Clásicos que NO han enviado EIR,
+        por lo que solo tenemos MAC y RSSI (el nombre llega después con Extended Inquiry).
+
+        Estructura del payload:
+          [0]         num_responses — número de dispositivos en esta respuesta
+          Por cada dispositivo (15 bytes fijos):
+            [0:6]     BD_ADDR       — MAC en little-endian
+            [6]       Page_Scan_Repetition_Mode
+            [7:9]     Reserved      — 2 bytes sin uso
+            [9:12]    Class_of_Device
+            [12:14]   Clock_Offset
+            [14]      RSSI          — int8 signed
+        """
+        if not payload:
+            return
+
+        num = payload[0]   # número de respuestas en el paquete
+        for i in range(num):
+            # Calcula el offset de inicio de esta respuesta (15 bytes cada una)
+            base = 1 + i * 15
+
+            # Comprueba que los 15 bytes están dentro del payload
+            if base + 15 > len(payload):
+                break
+
+            # Extrae MAC (6 bytes LE) y RSSI (byte 14, int8 signed)
+            mac_raw = payload[base: base + 6]
+            rssi    = struct.unpack('b', bytes([payload[base + 14]]))[0]
+            mac     = _mac_from_bytes_le(mac_raw)
+            _dbg(f'    INQUIRY_RSSI[{i}]  mac={mac}  rssi={rssi}')
+
+            # El nombre llegará más tarde en un Extended Inquiry Result; por ahora es None
+            report = {
+                'mac':             mac,
+                'rssi':            rssi,
+                'bt_type':         'CLASSIC',
+                'addr_type':       'public',
+                'name':            None,
+                'manufacturer_id': None,
+                'uuids':           [],
+            }
+            self._register_classic_device(report)
+
+    # ── Parseo Extended Inquiry Result (0x2F) ──────────────────
+
+    def _parse_extended_inquiry(self, payload: bytes) -> None:
+        """
+        Parsea el evento HCI_EV_EXTENDED_INQUIRY (0x2F).
+        Siempre contiene exactamente 1 dispositivo. Incluye nombre y UUIDs en el EIR.
+
+        Estructura del payload (255 bytes totales):
+          [0]        num_responses — siempre 1
+          [1:7]      BD_ADDR       — MAC en little-endian
+          [7]        Page_Scan_Repetition_Mode
+          [8]        Reserved
+          [9:12]     Class_of_Device
+          [12:14]    Clock_Offset
+          [14]       RSSI          — int8 signed
+          [15:255]   EIR data      — 240 bytes de estructuras TLV (mismo formato que AD)
+        """
+        # Necesitamos al menos 15 bytes para llegar al RSSI
+        if len(payload) < 15:
+            return
+
+        # payload[0] = num_responses (siempre 1, no se usa explícitamente)
+        mac_raw  = payload[1:7]    # MAC del dispositivo
+        rssi     = struct.unpack('b', bytes([payload[14]]))[0]   # RSSI signed
+
+        # Los datos EIR ocupan desde el byte 15 hasta el 255 (máx 240 bytes útiles)
+        eir_data = payload[15:255] if len(payload) >= 255 else payload[15:]
+
+        mac    = _mac_from_bytes_le(mac_raw)
+        parsed = _parse_ad_structures(eir_data)   # parsea nombre, UUIDs, etc.
+        _dbg(f'    EXTENDED_INQ  mac={mac}  rssi={rssi}  name={parsed.get("name")!r}')
+
+        report = {
+            'mac':             mac,
+            'rssi':            rssi,
+            'bt_type':         'CLASSIC',
+            'addr_type':       'public',
+            'name':            parsed.get('name'),
+            'manufacturer_id': parsed.get('manufacturer_id'),
+            'uuids':           parsed.get('uuids', []),
+        }
+        self._register_classic_device(report)
+
+    # ── Registro de dispositivos ───────────────────────────────
+
+    def _register_ble_device(self, report: dict) -> None:
+        """
+        Registra o actualiza un dispositivo BLE en el caché _seen.
+
+        Si la MAC ya existe: actualiza last_seen, rssi, name (si mejoró) y
+        acumula UUIDs y manufacturer_id nuevos.
+        Si es nueva: crea el BTDevice y lo encola en _event_queue para el callback.
+
+        Usa _lock para proteger el acceso concurrente a _seen desde múltiples hilos.
+        """
         mac = report['mac']
         now = time.time()
 
-        with self._seen_lock:
+        with self._lock:
             if mac in self._seen:
-                dev = self._seen[mac]
+                # Dispositivo ya conocido: actualiza solo los campos que pueden cambiar
+                dev           = self._seen[mac]
                 dev.last_seen = now
-                dev.rssi      = report['rssi']
-                if report['name'] and not dev.name:
+
+                # Actualiza el RSSI solo si el nuevo valor no es None
+                dev.rssi = report['rssi'] if report['rssi'] is not None else dev.rssi
+
+                # Actualiza el nombre si el nuevo paquete lo incluye (SCAN_RSP suele traerlo)
+                if report.get('name'):
                     dev.name = report['name']
+
+                # Acumula UUIDs nuevos que no estuvieran ya en la lista
+                for u in report.get('uuids', []):
+                    if u not in dev.uuids:
+                        dev.uuids.append(u)
+
+                # Actualiza el manufacturer_id si este paquete lo trae
+                if report.get('manufacturer_id') is not None:
+                    dev.manufacturer_id = report['manufacturer_id']
+
             else:
-                dev = BTDevice(
-                    mac=mac,
-                    name=report['name'],
-                    rssi=report['rssi'],
-                    bt_type='BLE',
-                    addr_type=report['addr_type'],
-                    adv_type=report['event_type_name'],
-                    manufacturer_id=report['manufacturer_id'],
-                    uuids=report['uuids'],
-                    raw_adv_data=report['raw_adv_data'],
-                    first_seen=now,
-                    last_seen=now,
-                )
-                self._seen[mac] = dev
-
-        self._event_queue.put(dev)
-
-    def _register_classic_device(self, report: dict):
-        mac = report['mac']
-        now = time.time()
-
-        with self._seen_lock:
-            if mac in self._seen:
-                dev = self._seen[mac]
-                dev.last_seen = now
-                dev.rssi      = report['rssi']
-                if report.get('name') and not dev.name:
-                    dev.name = report['name']
-            else:
+                # Dispositivo nuevo: crea el dataclass y lo añade al caché
                 dev = BTDevice(
                     mac=mac,
                     name=report.get('name'),
                     rssi=report['rssi'],
-                    bt_type='CLASSIC',
-                    addr_type='public',
-                    adv_type=None,
+                    bt_type='BLE',
+                    addr_type=report.get('addr_type', 'public'),
+                    adv_type=report.get('adv_type'),
                     manufacturer_id=report.get('manufacturer_id'),
                     uuids=report.get('uuids', []),
                     first_seen=now,
@@ -623,101 +1046,174 @@ class BluetoothScanner:
                 )
                 self._seen[mac] = dev
 
-        self._event_queue.put(dev)
+                # Encola el dispositivo para que _dispatch_loop llame al callback
+                self._event_queue.put(dev)
 
-    # ── Dispatcher de callbacks ──────────────────────────────────────────────
+    def _register_classic_device(self, report: dict) -> None:
+        """
+        Registra o actualiza un dispositivo Bluetooth Clásico en el caché _seen.
 
-    def _dispatch_loop(self):
-        """Entrega los BTDevice al callback on_device desde un hilo dedicado."""
-        while self._running.is_set() or not self._event_queue.empty():
+        Funciona igual que _register_ble_device pero sin acumular UUIDs extra
+        (los Clásicos solo dan nombre, no listas de UUIDs en cada Inquiry).
+        """
+        mac = report['mac']
+        now = time.time()
+
+        with self._lock:
+            if mac in self._seen:
+                # Dispositivo ya conocido: actualiza timestamp, RSSI y nombre
+                dev           = self._seen[mac]
+                dev.last_seen = now
+                dev.rssi      = report['rssi'] if report['rssi'] is not None else dev.rssi
+                if report.get('name'):
+                    dev.name = report['name']
+
+            else:
+                # Dispositivo nuevo: crea el dataclass y lo añade al caché
+                dev = BTDevice(
+                    mac=mac,
+                    name=report.get('name'),
+                    rssi=report['rssi'],
+                    bt_type='CLASSIC',
+                    addr_type='public',
+                    manufacturer_id=report.get('manufacturer_id'),
+                    uuids=report.get('uuids', []),
+                    first_seen=now,
+                    last_seen=now,
+                )
+                self._seen[mac] = dev
+
+                # Encola el dispositivo para que _dispatch_loop llame al callback
+                self._event_queue.put(dev)
+
+    # ── Hilo de callbacks ──────────────────────────────────────
+
+    def _dispatch_loop(self) -> None:
+        """
+        Hilo separado que entrega BTDevice nuevos al callback on_device.
+
+        Desacopla la detección (hilo HCI) de la notificación (callback del usuario).
+        Esto evita que un callback lento bloquee la recepción de eventos HCI.
+        Solo se ejecuta cuando hay algo en la cola; el timeout de 0.5s permite
+        comprobar _running periódicamente aunque no lleguen dispositivos nuevos.
+        """
+        _dbg('DISPATCH_LOOP start')
+
+        while self._running.is_set():
             try:
-                dev = self._event_queue.get(timeout=1)
-                if self.on_device:
-                    try:
-                        self.on_device(dev)
-                    except Exception as e:
-                        log.error("Error en on_device callback: %s", e)
+                # Espera hasta 0.5s por un nuevo BTDevice en la cola
+                dev = self._event_queue.get(timeout=0.5)
             except queue.Empty:
+                # No llegó nada en 0.5s: vuelve a comprobar _running
                 continue
 
+            # Si hay callback registrado, lo llama con el dispositivo nuevo
+            if self.on_device:
+                try:
+                    self.on_device(dev)
+                except Exception as e:
+                    # El callback no debe poder tumbar el hilo de dispatch
+                    _dbg(f'DISPATCH on_device excepción: {e!r}')
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tabla viva en terminal
-# ──────────────────────────────────────────────────────────────────────────────
-
-_RST  = '\033[0m'
-_BOLD = '\033[1m'
-_RED  = '\033[91m'
-_YEL  = '\033[93m'
-_WHT  = '\033[97m'
-_GRY  = '\033[90m'
-_CYA  = '\033[96m'
-_CLR  = '\033[2J\033[H'
-
-_PROX_COLOR = {'dentro': _RED, 'cerca': _YEL, 'fuera': _WHT, 'unknown': _GRY}
+        _dbg('DISPATCH_LOOP terminado')
 
 
-def _rssi_bar(rssi: int | None, width: int = 8) -> str:
-    if rssi is None:
-        return '·' * width
-    pct = max(0.0, min(1.0, (rssi + 100) / 60))
-    n = round(pct * width)
-    return '█' * n + '░' * (width - n)
+# ──────────────────────────────────────────────────────────────
+# PUNTO DE ENTRADA
+# ──────────────────────────────────────────────────────────────
 
+def main() -> None:
+    """
+    Punto de entrada del script. Verifica privilegios root, crea el scanner,
+    lo arranca y mantiene un bucle de visualización que refresca la tabla
+    de dispositivos en terminal cada segundo hasta que el usuario pulse Ctrl+C.
+    Al salir imprime el resumen final y la ruta del log de debug.
+    """
+    # El socket HCI RAW requiere CAP_NET_RAW, que solo tiene root
+    if os.geteuid() != 0:
+        print('Error: se requiere ejecutar como root (sudo).')
+        sys.exit(1)
 
-def _render(devices: list[BTDevice], elapsed: int, total: int) -> str:
-    devs = sorted(devices, key=lambda d: d.rssi or -120, reverse=True)
-    hdr  = f"{'TIPO':<8} {'MAC':<17}  {'RSSI':>8}  {'SEÑAL':<8}  {'PROX':<8}  {'DIR':<3}  NOMBRE"
-    sep  = '─' * 78
-    out  = [
-        f"{_CYA}{_BOLD}  Detector BT  │  {elapsed:>3}/{total}s  │  {len(devs)} dispositivo(s){_RST}",
-        f"{_CYA}{sep}{_RST}",
-        f"{_BOLD}{hdr}{_RST}",
-        f"{_GRY}{sep}{_RST}",
-    ]
-    for d in devs:
-        c   = _PROX_COLOR.get(d.proximity, _GRY)
-        rs  = f"{d.rssi:+4d} dBm" if d.rssi is not None else "   ? dBm"
-        nom = (d.name or '(sin nombre)')[:38]
-        adr = 'rnd' if d.is_random_address else 'pub'
-        out.append(
-            f"{c}{d.bt_type:<8}{_RST}"
-            f" {d.mac:<17}"
-            f"  {rs}"
-            f"  {_rssi_bar(d.rssi):<8}"
-            f"  {c}{d.proximity:<8}{_RST}"
-            f"  {adr}"
-            f"  {nom}"
-        )
-    if not devs:
-        out.append(f"  {_GRY}Esperando dispositivos…{_RST}")
-    out.append(f"{_GRY}{sep}{_RST}")
-    return '\n'.join(out)
+    print(f'Log de debug: {_LOG_PATH}')
+    print('Iniciando scanner... (Ctrl+C para parar)')
+
+    # Pausa breve para que el usuario vea el mensaje antes de limpiar la pantalla
+    time.sleep(0.5)
+
+    # Crea el scanner en modo BLE activo (scan_type=1 envía SCAN_REQ para obtener SCAN_RSP)
+    scanner = BluetoothScanner(scan_type=1)
+    scanner.start()
+
+    start_time = time.time()
+    try:
+        while True:
+            # Solo muestra dispositivos que tengan información identificativa Y hayan
+            # enviado algún paquete en los últimos 20 segundos.
+            # Los que llevan más de 20s sin aparecer se ocultan de la pantalla pero
+            # siguen en el caché interno por si vuelven a emitir.
+            ahora = time.time()
+            devs  = [
+                d for d in scanner.devices
+                if (d.name or d.manufacturer_id is not None or d.uuids)
+                and (ahora - d.last_seen) <= 20
+            ]
+            ts      = time.strftime('%H:%M:%S')
+            elapsed = int(time.time() - start_time)
+
+            # Estado del hilo de captura para detectar si ha muerto inesperadamente
+            alive = f'{GREEN}VIVO{RESET}' if scanner.dbg_loop_alive else f'{RED}MUERTO{RESET}'
+
+            # Segundos desde el último evento HCI recibido (-1 si aún no llegó ninguno)
+            last_ev_age = int(time.time() - scanner.dbg_last_ev_ts) if scanner.dbg_last_ev_ts else -1
+
+            # Limpia la pantalla y redibuja la interfaz completa
+            print(CLEAR, end='')
+            print(f"{BOLD}=== TFG Detector Fraude Académico — Bluetooth Scanner [DEBUG] ==={RESET}")
+            print(
+                f"  Hora: {ts}  |  Activo: {elapsed}s  |  Dispositivos: {len(devs)}  |  "
+                f"Hilo captura: {alive}  |  Ctrl+C para parar"
+            )
+
+            # Fila de contadores de debug para monitorizar el estado del scanner
+            print(
+                f"  Eventos recibidos: {scanner.dbg_recv_total}  |  "
+                f"BLE adv: {scanner.dbg_ble_reports}  |  "
+                f"Inq results: {scanner.dbg_inq_results}  |  "
+                f"Inq complete: {scanner.dbg_inq_complete}  |  "
+                f"Desconocidos: {scanner.dbg_unknown_ev}  |  "
+                f"OSErrors: {scanner.dbg_oserror}  |  "
+                f"Último evento: {last_ev_age}s ago  (code=0x{scanner.dbg_last_ev_code:02X})"
+            )
+            print(f"  {CYAN}Log detallado: tail -f {_LOG_PATH}{RESET}")
+            print()
+
+            # Muestra la tabla de dispositivos o el mensaje de espera
+            if devs:
+                print(_render_table(devs))
+            else:
+                print('  Buscando dispositivos...')
+
+            # Espera 1 segundo antes del siguiente refresco
+            time.sleep(1.0)
+
+    except KeyboardInterrupt:
+        # El usuario pulsó Ctrl+C: sale del bucle limpiamente
+        pass
+
+    finally:
+        # Se ejecuta siempre al salir, tanto por Ctrl+C como por cualquier excepción
+        scanner.stop()
+        _dbg('main() terminado por el usuario')
+
+        # Imprime el resumen final ordenado por RSSI descendente
+        print(f'\n{BOLD}Escaneo finalizado. Total dispositivos detectados: {len(scanner.devices)}{RESET}')
+        for dev in sorted(scanner.devices, key=lambda d: d.rssi or -999, reverse=True):
+            print(
+                f'  {dev.bt_type:<8} {dev.mac}  RSSI={dev.rssi}  PROX={dev.proximity}'
+                f'  NOMBRE={dev.name or "—"}'
+            )
+        print(f'\nLog completo en: {_LOG_PATH}')
 
 
 if __name__ == '__main__':
-    import sys
-
-    logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
-
-    duration  = int(sys.argv[1]) if len(sys.argv) > 1 else 30
-    scan_type = int(sys.argv[2]) if len(sys.argv) > 2 else 1
-
-    scanner = BluetoothScanner(dev_id=0, ble_scan_type=scan_type)
-    scanner.start()
-
-    start = time.time()
-    try:
-        while True:
-            elapsed = int(time.time() - start)
-            if elapsed >= duration:
-                break
-            print(_CLR + _render(scanner.devices, elapsed, duration), flush=True)
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        scanner.stop()
-
-    print(_CLR + _render(scanner.devices, duration, duration))
-    print(f"\n{_BOLD}Escaneo completado.{_RST}  Total únicos: {len(scanner.devices)}")
+    main()
