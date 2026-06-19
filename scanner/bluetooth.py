@@ -815,17 +815,6 @@ class BluetoothScanner:
             _dbg(f'  EVENTO NO FILTRADO  code=0x{ev_code:02X} (llegó igualmente al socket)')
             self._inc('dbg_unknown_ev')
 
-    # ── MÉTODO NO UTILIZADO ────────────────────────────────────
-    # _relaunch_inquiry_unused fue el diseño original donde el Inquiry se relanzaba
-    # directamente al recibir INQUIRY_COMPLETE. Se descartó porque ese evento no llega
-    # al socket compartido con BLE en el BCM43455. Fue reemplazado por el timer temporal
-    # en _launch_inquiry + _on_inquiry_done. Se mantiene como referencia histórica.
-    #
-    # def _relaunch_inquiry_unused(self, sock):
-    #     if not self._running.is_set():
-    #         return
-    #     sock.send(cmd_inquiry(duration=8))
-
     # ── Parseo BLE Advertising Report ─────────────────────────
 
     def _parse_ble_adv_report(self, payload: bytes) -> None:
