@@ -1,0 +1,17 @@
+[Unit]
+Description=Detector Fraude Académico — API REST
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/raspi831/TFG-Detector
+ExecStart=/usr/bin/python3 /home/raspi831/TFG-Detector/web/api.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -94,8 +94,8 @@ AD_UUID128_COMP  = 0x07   # lista completa de UUIDs de 128 bits
 AD_MANUFACTURER  = 0xFF   # datos específicos del fabricante (company ID + payload)
 
 # Códigos de escape ANSI para colorear la salida en terminal
-RED    = '\033[91m'   # rojo   → dispositivo dentro del aula (RSSI >= -85)
-YELLOW = '\033[93m'   # amarillo → dispositivo cerca         (RSSI >= -95)
+RED    = '\033[91m'   # rojo   → dispositivo cerca          (RSSI >= -85)
+YELLOW = '\033[93m'   # amarillo → dentro del aula           (RSSI >= -95)
 WHITE  = '\033[97m'   # blanco → dispositivo fuera            (RSSI <  -95)
 CYAN   = '\033[96m'   # cian   → cabecera de la tabla
 GREEN  = '\033[92m'   # verde  → estado "hilo vivo" en debug
@@ -187,17 +187,17 @@ class BTDevice:
         Los umbrales están calibrados para un aula estándar con paredes de hormigón.
 
         Devuelve:
-          'dentro'      — RSSI >= -85 dBm: el dispositivo está en el aula
-          'cerca'       — RSSI >= -95 dBm: está justo fuera o en el pasillo
-          'fuera'       — RSSI <  -95 dBm: está lejos, fuera del perímetro
-          'desconocido' — si aún no se ha recibido ningún RSSI
+          'cerca'         — RSSI >= -85 dBm: el dispositivo está muy próximo
+          'dentro del aula' — RSSI >= -95 dBm: está en el aula o pasillo contiguo
+          'fuera'         — RSSI <  -95 dBm: está lejos, fuera del perímetro
+          'desconocido'   — si aún no se ha recibido ningún RSSI
         """
         if self.rssi is None:
             return 'desconocido'
         if self.rssi >= -85:
-            return 'dentro'
-        if self.rssi >= -95:
             return 'cerca'
+        if self.rssi >= -95:
+            return 'dentro del aula'
         return 'fuera'
 
 
@@ -397,7 +397,7 @@ def _proximity_color(proximity: str) -> str:
     Devuelve el código ANSI de color correspondiente a una zona de proximidad.
     Rojo = dentro del aula, amarillo = cerca, blanco = fuera.
     """
-    return {'dentro': RED, 'cerca': YELLOW, 'fuera': WHITE}.get(proximity, WHITE)
+    return {'cerca': RED, 'dentro del aula': YELLOW, 'fuera': WHITE}.get(proximity, WHITE)
 
 
 def _render_table(devices: list) -> str:
