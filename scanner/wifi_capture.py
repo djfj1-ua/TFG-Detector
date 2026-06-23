@@ -25,7 +25,7 @@ from typing import Callable, Optional
 # ──────────────────────────────────────────────────────────────
 
 # Tipos de frame 802.11 (bits 2-3 del byte 0 del Frame Control)
-FRAME_TYPE_MGMT = 0x00   # Management: Beacon, Probe, Auth, Assoc
+FRAME_TYPE_MGMT = 0x00   # Gestión: Beacon, Probe, Auth, Assoc
 FRAME_TYPE_CTRL = 0x01   # Control: ACK, RTS, CTS  (se ignoran)
 FRAME_TYPE_DATA = 0x02   # Data: tráfico de usuario (se ignoran)
 
@@ -75,11 +75,6 @@ _FIXED_FIELDS_SIZE = {
 # Tags de Information Elements (IEs) — formato TLV compartido por todos los Mgmt frames
 IE_SSID     = 0x00   # SSID del AP o de la red buscada (Probe Request wildcard si len=0)
 IE_DS_PARAM = 0x03   # DS Parameter Set: canal actual del AP (1 byte sin signo)
-IE_RSN      = 0x30   # Robust Security Network → WPA2 / WPA3
-IE_VENDOR   = 0xDD   # Vendor Specific: puede contener WPA Information Element (Microsoft)
-
-# OUI de Microsoft + tipo 0x01: identifica el WPA IE anterior a RSN (WPA1)
-_MS_OUI_WPA = b'\x00\x50\xf2\x01'
 
 
 # ──────────────────────────────────────────────────────────────
@@ -229,19 +224,6 @@ ETH_P_ALL = 0x0003
 # Canales 2.4 GHz (normativa europea: 1-13)
 _CHANNELS_2GHZ: list = list(range(1, 14))
 
-# Canales 5 GHz más comunes en Europa.
-# UNII-1 (sin DFS) son los más seguros para hopping porque el hardware
-# no necesita esperar el periodo de "channel availability check" de 60s.
-# UNII-2 y UNII-2E requieren DFS; el driver puede rechazar el cambio si no
-# hay soporte DFS activo, por lo que se incluyen pero se ignoran los errores.
-_CHANNELS_5GHZ: list = [
-    36, 40, 44, 48,              # UNII-1  (sin DFS, preferidos)
-    52, 56, 60, 64,              # UNII-2  (DFS)
-    100, 104, 108, 112, 116,     # UNII-2E (DFS)
-    132, 136, 140,               # UNII-2E (DFS)
-    149, 153, 157, 161, 165,     # UNII-3  (sin DFS en algunos países)
-]
-
 # Tiempo de permanencia en cada canal antes de saltar al siguiente (segundos).
 # Con 200 ms: un barrido completo de 2.4 GHz dura 13 × 0.2 = 2.6 s.
 # Reducirlo mejora la cobertura temporal pero puede perder frames cortos.
@@ -261,12 +243,10 @@ class WifiDevice:
     mac:          str            # XX:XX:XX:XX:XX:XX mayúsculas — dirección transmisora (addr2)
     ssid:         Optional[str]  # SSID anunciado (Beacon) o buscado (Probe Request); '' = wildcard
     rssi:         Optional[int]  # potencia de señal recibida en dBm (negativo)
-    channel:      Optional[int]  # canal 802.11 (1-13 en 2.4GHz, 36-165 en 5GHz)
+    channel:      Optional[int]  # canal 802.11 (1-13 en 2.4GHz)
     frequency:    Optional[int]  # frecuencia en MHz
     frame_type:   str            # tipo del último frame recibido (BEACON, PROBE_REQ, etc.)
-    addr_type:    str            # 'random' si MAC locally-administered, 'public' si OUI global
-    is_protected: bool           # True si se detectó RSN IE (WPA2/WPA3) o WPA IE
-    manufacturer: Optional[str]  # fabricante según OUI; None si MAC aleatoria o OUI desconocido
+    manufacturer: Optional[str]  # fabricante según OUI; None si OUI desconocido
     first_seen:   float          = field(default_factory=time.time)
     last_seen:    float          = field(default_factory=time.time)
 
@@ -395,15 +375,6 @@ def _mac_str(raw6: bytes) -> str:
     return ':'.join(f'{b:02X}' for b in raw6)
 
 
-def _is_random_mac(raw6: bytes) -> bool:
-    """
-    Detecta si una dirección MAC es locally-administered (aleatorizada).
-    El bit 1 (0x02) del primer octeto a 1 indica dirección local, no asignada por el IEEE.
-    Los teléfonos modernos usan MACs aleatorias en Probe Requests para proteger la privacidad.
-    """
-    return bool(raw6[0] & 0x02)
-
-
 def _is_unicast_mac(raw6: bytes) -> bool:
     """
     El bit 0 (0x01) del primer octeto a 0 indica dirección unicast.
@@ -459,9 +430,6 @@ def _parse_dot11_header(frame: bytes) -> Optional[dict]:
     if fc_type != FRAME_TYPE_MGMT:
         return None
 
-    # Flags del segundo byte del Frame Control
-    protected = bool(fc1 & 0x40)   # bit 6: frame protegido (MFP — Management Frame Protection)
-
     # Extrae las tres direcciones MAC de la cabecera fija
     addr1_raw = frame[4:10]    # dirección destino (receptor)
     addr2_raw = frame[10:16]   # dirección origen  (transmisor) ← clave para identificar
@@ -474,11 +442,10 @@ def _parse_dot11_header(frame: bytes) -> Optional[dict]:
 
     return {
         'subtype':     subtype,
-        'protected':   protected,
         'addr1':       _mac_str(addr1_raw),
         'addr2':       _mac_str(addr2_raw),
         'addr3':       _mac_str(addr3_raw),
-        'addr2_raw':   addr2_raw,   # bytes crudos para detectar MAC aleatoria y unicast
+        'addr2_raw':   addr2_raw,   # bytes crudos para el filtro unicast
         'body_offset': body_offset,
     }
 
@@ -503,23 +470,12 @@ def _parse_ies(body: bytes) -> dict:
       Tag 0x00 (IE_SSID)     — nombre de la red en UTF-8
                                length=0 → wildcard (Probe Request sin SSID concreto)
       Tag 0x03 (IE_DS_PARAM) — canal actual del AP (1 byte u8)
-      Tag 0x30 (IE_RSN)      — RSN Information Element → indica WPA2 o WPA3
-      Tag 0xDD (IE_VENDOR)   — Vendor Specific: si OUI=00:50:F2 + type=0x01 → WPA1
-
-    IEs ignorados intencionadamente:
-      Tag 0x01 — Supported Rates: tasas de datos soportadas (no relevante)
-      Tag 0x07 — Country: código de país (no relevante)
-      Tag 0x2D — HT Capabilities: parámetros 802.11n (no relevante)
-      Tag 0x3D — HT Operation (no relevante)
-      Resto    — silenciados
 
     Devuelve:
       ssid     — nombre de red (str), '' si wildcard, None si no hay IE_SSID
       channel  — número de canal (int) o None si no hay IE_DS_PARAM
-      is_wpa2  — True si hay RSN IE presente (WPA2 o WPA3)
-      is_wpa   — True si hay Vendor Specific WPA IE de Microsoft (WPA1)
     """
-    result: dict = {'ssid': None, 'channel': None, 'is_wpa2': False, 'is_wpa': False}
+    result: dict = {'ssid': None, 'channel': None}
     i = 0
 
     while i < len(body):
@@ -552,20 +508,7 @@ def _parse_ies(body: bytes) -> dict:
 
         # ── DS Parameter Set — canal ───────────────────────────
         elif tag == IE_DS_PARAM and length >= 1:
-            # Un solo byte con el número de canal en el que opera el AP
             result['channel'] = value[0]
-
-        # ── RSN — WPA2 / WPA3 ─────────────────────────────────
-        elif tag == IE_RSN:
-            # Solo necesitamos saber que está presente (indica cifrado moderno)
-            result['is_wpa2'] = True
-
-        # ── Vendor Specific — WPA1 (Microsoft OUI) ────────────
-        elif tag == IE_VENDOR and length >= 4:
-            # Los primeros 3 bytes son el OUI del vendedor, el 4.º el subtipo
-            # OUI=00:50:F2 + tipo=0x01 → WPA Information Element (anterior a RSN/WPA2)
-            if value[:4] == _MS_OUI_WPA:
-                result['is_wpa'] = True
 
     return result
 
@@ -621,17 +564,8 @@ def _render_table(devices: list) -> str:
         else:
             ssid_display = f'"{dev.ssid[:20]}"'
 
-        # Fabricante desde OUI (solo en MACs públicas); en MACs aleatorias muestra [R]
-        if dev.addr_type == 'random':
-            fab = '[R]'
-        elif dev.manufacturer:
-            fab = dev.manufacturer[:18]
-        else:
-            fab = '?'
-
-        # Indicadores de cifrado y separador fabricante/SSID
-        enc  = ' [WPA]' if dev.is_protected else ''
-        info = f'{fab:<18}  {ssid_display}{enc}' if ssid_display else f'{fab}{enc}'
+        fab  = dev.manufacturer[:18] if dev.manufacturer else '?'
+        info = f'{fab:<18}  {ssid_display}' if ssid_display else fab
 
         lines.append(
             f"{color}{dev.frame_type:<10} {dev.mac:<19} {rssi_str}  {bar:<10} "
@@ -657,8 +591,6 @@ def _set_channel(iface: str, channel: int) -> bool:
       y no aporta valor al TFG. 'iw' es la herramienta oficial del kernel.
 
     Devuelve True si el cambio se realizó con éxito, False en caso contrario.
-    Los fallos silenciosos son habituales en canales DFS o no soportados
-    por el hardware; el hopper simplemente pasa al siguiente canal.
     """
     try:
         result = subprocess.run(
@@ -689,8 +621,7 @@ class WifiScanner:
 
     def __init__(self, iface: str = MONITOR_IFACE,
                  on_device: Optional[Callable[[WifiDevice], None]] = None,
-                 hop_interval: float = HOP_INTERVAL_DEFAULT,
-                 scan_5ghz: bool = False):
+                 hop_interval: float = HOP_INTERVAL_DEFAULT):
         """
         Inicializa el scanner sin arrancarlo.
 
@@ -698,12 +629,10 @@ class WifiScanner:
           iface        — interfaz en modo monitor (por defecto wlan1)
           on_device    — callback llamado cada vez que se detecta un dispositivo nuevo
           hop_interval — segundos de permanencia en cada canal (por defecto 0.20 s)
-          scan_5ghz    — si True, incluye los canales 5 GHz en el hopping
         """
         self._iface        = iface
         self.on_device     = on_device
         self._hop_interval = hop_interval
-        self._scan_5ghz    = scan_5ghz
 
         # Caché de dispositivos detectados, indexado por addr2 (MAC transmisora)
         self._seen: dict[str, WifiDevice] = {}
@@ -810,9 +739,7 @@ class WifiScanner:
         y cambia wlan1 a cada uno mediante 'iw', esperando hop_interval
         segundos antes de pasar al siguiente.
 
-        Secuencia de canales:
-          2.4 GHz: 1 → 2 → … → 13 → 1 → … (siempre activo)
-          5 GHz:   intercalados con los 2.4 GHz si scan_5ghz=True
+        Secuencia de canales: 1 → 2 → … → 13 → 1 → … (ciclo continuo)
 
         El bucle de dwell usa incrementos de 50 ms en lugar de un único
         time.sleep(hop_interval) para reaccionar rápidamente a stop().
@@ -823,11 +750,7 @@ class WifiScanner:
           de canal se retrasaría hasta el próximo frame o el timeout, lo
           que rompería la cadencia de hopping en canales silenciosos.
         """
-        channels = _CHANNELS_2GHZ[:]
-        if self._scan_5ghz:
-            channels += _CHANNELS_5GHZ
-
-        for ch in itertools.cycle(channels):
+        for ch in itertools.cycle(_CHANNELS_2GHZ):
             if not self._running.is_set():
                 break
 
@@ -881,27 +804,22 @@ class WifiScanner:
         if not _is_unicast_mac(dot11['addr2_raw']):
             return
 
-        # Paso 4: IEs — se parsean siempre; si el frame está MFP-protegido
-        # el parser devuelve simplemente los defaults sin crashear
+        # Paso 4: IEs
         body_start = dot11['body_offset']
-        ies: dict  = {'ssid': None, 'channel': None, 'is_wpa2': False, 'is_wpa': False}
+        ies: dict  = {'ssid': None, 'channel': None}
         if len(frame) > body_start:
             ies = _parse_ies(frame[body_start:])
 
         # Paso 5: el canal del IE_DS_PARAM es más preciso que el del RadioTap
-        # (RadioTap refleja el canal en el que el receptor estaba sintonizado,
-        # que puede diferir del canal del AP en redes con banda dual)
         channel = ies.get('channel') or rt.get('channel')
 
         report = {
-            'mac':          dot11['addr2'],
-            'mac_raw':      dot11['addr2_raw'],
-            'ssid':         ies.get('ssid'),
-            'rssi':         rt.get('rssi'),
-            'channel':      channel,
-            'frequency':    rt.get('frequency'),
-            'frame_type':   SUBTYPE_NAMES[subtype],
-            'is_protected': dot11['protected'] or ies['is_wpa2'] or ies['is_wpa'],
+            'mac':       dot11['addr2'],
+            'ssid':      ies.get('ssid'),
+            'rssi':      rt.get('rssi'),
+            'channel':   channel,
+            'frequency': rt.get('frequency'),
+            'frame_type': SUBTYPE_NAMES[subtype],
         }
         self._register_device(report)
 
@@ -916,7 +834,6 @@ class WifiScanner:
         Si la MAC ya existe:
           - Actualiza last_seen, rssi, frame_type
           - Actualiza ssid y channel solo si el nuevo frame los trae (no sobreescribe con None)
-          - is_protected es acumulativo: una vez detectado cifrado no se borra
 
         Si es nueva:
           - Crea el WifiDevice y lo encola para el callback on_device
@@ -938,13 +855,7 @@ class WifiScanner:
                     dev.channel = report['channel']
                 if report['frequency'] is not None:
                     dev.frequency = report['frequency']
-                if report['is_protected']:
-                    dev.is_protected = True
             else:
-                addr_type = 'random' if _is_random_mac(report['mac_raw']) else 'public'
-                # El fabricante solo se puede determinar con MACs públicas (OUI real).
-                # En MACs aleatorias los primeros 3 bytes no identifican a nadie.
-                manufacturer = _lookup_oui(mac) if addr_type == 'public' else None
                 dev = WifiDevice(
                     mac=mac,
                     ssid=report['ssid'],
@@ -952,9 +863,7 @@ class WifiScanner:
                     channel=report['channel'],
                     frequency=report['frequency'],
                     frame_type=report['frame_type'],
-                    addr_type=addr_type,
-                    is_protected=report['is_protected'],
-                    manufacturer=manufacturer,
+                    manufacturer=_lookup_oui(mac),
                     first_seen=now,
                     last_seen=now,
                 )
@@ -1023,8 +932,7 @@ def main() -> None:
                 f"Dispositivos activos: {len(devs)}  |  "
                 f"Total detectados: {len(scanner.devices)}  |  Ctrl+C para parar"
             )
-            print(f"  Interfaz: {MONITOR_IFACE}  |  Escuchando: {ch_str}  |  "
-                  f"[R] = MAC aleatoria  |  [WPA] = red cifrada")
+            print(f"  Interfaz: {MONITOR_IFACE}  |  Escuchando: {ch_str}")
             print()
 
             if devs:
@@ -1045,13 +953,11 @@ def main() -> None:
             f'Total dispositivos detectados: {len(all_devs)}{RESET}'
         )
         for dev in sorted(all_devs, key=lambda d: d.rssi or -999, reverse=True):
-            enc  = ' WPA' if dev.is_protected else ''
-            rnd  = ' [R]' if dev.addr_type == 'random' else ''
             ssid = f'  SSID={dev.ssid!r}' if dev.ssid is not None else ''
             fab  = f'  {dev.manufacturer}' if dev.manufacturer else ''
             print(
                 f'  {dev.frame_type:<10} {dev.mac}  RSSI={dev.rssi}  '
-                f'PROX={dev.proximity}  CH={dev.channel}{enc}{rnd}{fab}{ssid}'
+                f'PROX={dev.proximity}  CH={dev.channel}{fab}{ssid}'
             )
 
 
