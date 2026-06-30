@@ -7,11 +7,9 @@ DEBUG VERSION — escribe log detallado en /tmp/bt_debug.log
 """
 
 import ctypes
-import os
 import queue
 import socket
 import struct
-import sys
 import threading
 import time
 import traceback
@@ -92,17 +90,6 @@ AD_UUID16_COMP   = 0x03   # lista completa de UUIDs de 16 bits
 AD_UUID128_INC   = 0x06   # lista incompleta de UUIDs de 128 bits
 AD_UUID128_COMP  = 0x07   # lista completa de UUIDs de 128 bits
 AD_MANUFACTURER  = 0xFF   # datos específicos del fabricante (company ID + payload)
-
-# Códigos de escape ANSI para colorear la salida en terminal
-RED    = '\033[91m'   # rojo   → dispositivo cerca          (RSSI >= -85)
-YELLOW = '\033[93m'   # amarillo → dentro del aula           (RSSI >= -95)
-WHITE  = '\033[97m'   # blanco → dispositivo fuera            (RSSI <  -95)
-CYAN   = '\033[96m'   # cian   → cabecera de la tabla
-GREEN  = '\033[92m'   # verde  → estado "hilo vivo" en debug
-RESET  = '\033[0m'    # resetea todos los atributos de color
-BOLD   = '\033[1m'    # negrita
-CLEAR  = '\033[2J\033[H'   # limpia la pantalla y mueve el cursor al inicio
-
 
 # ──────────────────────────────────────────────────────────────
 # HCI FILTER — ARM64 Bookworm (ctypes nativo)
@@ -364,75 +351,6 @@ def cmd_inquiry(duration: int = 8) -> bytes:
     # LAP en little-endian + duration y num_responses como bytes sin signo
     params = b'\x33\x8B\x9E' + struct.pack('<BB', duration, 0)
     return _hci_cmd(OGF_LINK_CTL, OCF_INQUIRY, params)
-
-
-# ──────────────────────────────────────────────────────────────
-# DISPLAY
-# ──────────────────────────────────────────────────────────────
-
-def _signal_bar(rssi: Optional[int], width: int = 8) -> str:
-    """
-    Genera una barra de señal visual de texto usando bloques Unicode.
-
-    Convierte el RSSI (normalmente entre -100 y -40 dBm) a una barra de
-    caracteres llenos (█) y vacíos (░) proporcional a la potencia de señal.
-    Rango de referencia: -100 dBm = barra vacía, -40 dBm = barra llena.
-    """
-    if rssi is None:
-        # Sin dato de señal, devuelve la barra completamente vacía
-        return '░' * width
-
-    # Normaliza el RSSI al rango [0.0, 1.0]
-    # -100 dBm → 0.0,  -40 dBm → 1.0  (rango de 60 dBm)
-    normalized = max(0.0, min(1.0, (rssi + 100) / 60.0))
-
-    # Calcula cuántos bloques llenos corresponden
-    filled = round(normalized * width)
-
-    return '█' * filled + '░' * (width - filled)
-
-
-def _proximity_color(proximity: str) -> str:
-    """
-    Devuelve el código ANSI de color correspondiente a una zona de proximidad.
-    Rojo = dentro del aula, amarillo = cerca, blanco = fuera.
-    """
-    return {'cerca': RED, 'dentro del aula': YELLOW, 'fuera': WHITE}.get(proximity, WHITE)
-
-
-def _render_table(devices: list) -> str:
-    """
-    Construye la cadena de texto completa de la tabla de dispositivos para la terminal.
-    La tabla se ordena por RSSI descendente (el dispositivo más cercano aparece primero).
-    Cada fila incluye tipo, MAC, RSSI numérico, barra de señal, proximidad,
-    tipo de dirección, nombre y tiempo en segundos desde la última actualización.
-    """
-    lines = []
-
-    # Cabecera con los nombres de columna en negrita y cian
-    lines.append(
-        f"{BOLD}{CYAN}{'TIPO':<8} {'MAC':<19} {'RSSI':>5}  {'SEÑAL':<10} "
-        f"{'PROX':<12} {'DIR':<9} NOMBRE{RESET}"
-    )
-    lines.append('─' * 80)
-
-    # Ordena los dispositivos de mayor a menor RSSI (más cercano primero)
-    # Los dispositivos sin RSSI se colocan al final con valor ficticio -999
-    for dev in sorted(devices, key=lambda d: d.rssi if d.rssi is not None else -999, reverse=True):
-        color    = _proximity_color(dev.proximity)
-        bar      = _signal_bar(dev.rssi)
-        rssi_str = f'{dev.rssi:+4d}' if dev.rssi is not None else '  N/A'
-        name     = (dev.name or '')[:24]   # trunca el nombre a 24 caracteres
-
-        # Tiempo en segundos desde que se recibió el último paquete de este dispositivo
-        age = int(time.time() - dev.last_seen)
-
-        lines.append(
-            f"{color}{dev.bt_type:<8} {dev.mac:<19} {rssi_str}  {bar:<10} "
-            f"{dev.proximity:<12} {dev.addr_type:<9} {name}  [{age}s]{RESET}"
-        )
-
-    return '\n'.join(lines)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -730,7 +648,7 @@ class BluetoothScanner:
           3. Espera 5s de BLE puro  → timer para lanzar el siguiente Inquiry
 
         Por qué es necesario el reset BLE:
-        Verificado empíricamente: al terminar el Inquiry, el BCM43455 deja de emitir
+        Al terminar el Inquiry, el BCM43455 deja de emitir
         CUALQUIER evento HCI (incluidos los BLE advertising reports) hasta que se
         realice este ciclo disable+enable. Sin él, el scanner queda mudo indefinidamente.
         """
@@ -1105,104 +1023,3 @@ class BluetoothScanner:
                     _dbg(f'DISPATCH on_device excepción: {e!r}')
 
         _dbg('DISPATCH_LOOP terminado')
-
-
-# ──────────────────────────────────────────────────────────────
-# PUNTO DE ENTRADA
-# ──────────────────────────────────────────────────────────────
-
-def main() -> None:
-    """
-    Punto de entrada del script. Verifica privilegios root, crea el scanner,
-    lo arranca y mantiene un bucle de visualización que refresca la tabla
-    de dispositivos en terminal cada segundo hasta que el usuario pulse Ctrl+C.
-    Al salir imprime el resumen final y la ruta del log de debug.
-    """
-    # El socket HCI RAW requiere CAP_NET_RAW, que solo tiene root
-    if os.geteuid() != 0:
-        print('Error: se requiere ejecutar como root (sudo).')
-        sys.exit(1)
-
-    print(f'Log de debug: {_LOG_PATH}')
-    print('Iniciando scanner... (Ctrl+C para parar)')
-
-    # Pausa breve para que el usuario vea el mensaje antes de limpiar la pantalla
-    time.sleep(0.5)
-
-    # Crea el scanner en modo BLE activo (scan_type=1 envía SCAN_REQ para obtener SCAN_RSP)
-    scanner = BluetoothScanner(scan_type=1)
-    scanner.start()
-
-    start_time = time.time()
-    try:
-        while True:
-            # Solo muestra dispositivos que tengan información identificativa Y hayan
-            # enviado algún paquete en los últimos 20 segundos.
-            # Los que llevan más de 20s sin aparecer se ocultan de la pantalla pero
-            # siguen en el caché interno por si vuelven a emitir.
-            ahora = time.time()
-            devs  = [
-                d for d in scanner.devices
-                if (d.name or d.manufacturer_id is not None or d.uuids)
-                and (ahora - d.last_seen) <= 20
-            ]
-            ts      = time.strftime('%H:%M:%S')
-            elapsed = int(time.time() - start_time)
-
-            # Estado del hilo de captura para detectar si ha muerto inesperadamente
-            alive = f'{GREEN}VIVO{RESET}' if scanner.dbg_loop_alive else f'{RED}MUERTO{RESET}'
-
-            # Segundos desde el último evento HCI recibido (-1 si aún no llegó ninguno)
-            last_ev_age = int(time.time() - scanner.dbg_last_ev_ts) if scanner.dbg_last_ev_ts else -1
-
-            # Limpia la pantalla y redibuja la interfaz completa
-            print(CLEAR, end='')
-            print(f"{BOLD}=== TFG Detector Fraude Académico — Bluetooth Scanner [DEBUG] ==={RESET}")
-            print(
-                f"  Hora: {ts}  |  Activo: {elapsed}s  |  Dispositivos: {len(devs)}  |  "
-                f"Hilo captura: {alive}  |  Ctrl+C para parar"
-            )
-
-            # Fila de contadores de debug para monitorizar el estado del scanner
-            print(
-                f"  Eventos recibidos: {scanner.dbg_recv_total}  |  "
-                f"BLE adv: {scanner.dbg_ble_reports}  |  "
-                f"Inq results: {scanner.dbg_inq_results}  |  "
-                f"Inq complete: {scanner.dbg_inq_complete}  |  "
-                f"Desconocidos: {scanner.dbg_unknown_ev}  |  "
-                f"OSErrors: {scanner.dbg_oserror}  |  "
-                f"Último evento: {last_ev_age}s ago  (code=0x{scanner.dbg_last_ev_code:02X})"
-            )
-            print(f"  {CYAN}Log detallado: tail -f {_LOG_PATH}{RESET}")
-            print()
-
-            # Muestra la tabla de dispositivos o el mensaje de espera
-            if devs:
-                print(_render_table(devs))
-            else:
-                print('  Buscando dispositivos...')
-
-            # Espera 1 segundo antes del siguiente refresco
-            time.sleep(1.0)
-
-    except KeyboardInterrupt:
-        # El usuario pulsó Ctrl+C: sale del bucle limpiamente
-        pass
-
-    finally:
-        # Se ejecuta siempre al salir, tanto por Ctrl+C como por cualquier excepción
-        scanner.stop()
-        _dbg('main() terminado por el usuario')
-
-        # Imprime el resumen final ordenado por RSSI descendente
-        print(f'\n{BOLD}Escaneo finalizado. Total dispositivos detectados: {len(scanner.devices)}{RESET}')
-        for dev in sorted(scanner.devices, key=lambda d: d.rssi or -999, reverse=True):
-            print(
-                f'  {dev.bt_type:<8} {dev.mac}  RSSI={dev.rssi}  PROX={dev.proximity}'
-                f'  NOMBRE={dev.name or "—"}'
-            )
-        print(f'\nLog completo en: {_LOG_PATH}')
-
-
-if __name__ == '__main__':
-    main()

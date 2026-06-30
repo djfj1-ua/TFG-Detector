@@ -1,4 +1,24 @@
-# DESARROLLO — bluetoothPrueba.py
+# DESARROLLO — Sistema de detección de fraude académico
+
+Scanner Bluetooth (BLE + Clásico) y Wi-Fi 802.11 para el TFG de detección de fraude académico.  
+Hardware: Raspberry Pi 5 · BCM43455 (wlan0 AP) · Alfa AWUS036ACHM MT7612U (wlan1 monitor) · Raspberry Pi OS Bookworm 64-bit ARM64 · Kernel 6.x
+
+> **Restricción legal:** El sistema NO inhibe señales (ilegal bajo Ley 11/2022 española).  
+> Solo monitorización pasiva del espectro electromagnético. La interfaz solo escucha.
+
+---
+
+## Índice
+
+1. [Scanner Bluetooth](#1-scanner-bluetooth--bluetoothpy)
+2. [Scanner Wi-Fi](#2-scanner-wi-fi--wifi_capturepy)
+3. [API REST](#3-api-rest--webapypy)
+4. [Aplicación móvil Flutter](#4-aplicación-móvil-flutter)
+5. [Despliegue e integración del sistema](#5-despliegue-e-integración-del-sistema)
+
+---
+
+# 1. Scanner Bluetooth — `bluetooth.py`
 
 Scanner Bluetooth (BLE + Clásico) para el TFG de detección de fraude académico.  
 Hardware: Raspberry Pi 5 · BCM43455 · Raspberry Pi OS Bookworm 64-bit ARM64 · Kernel 6.x
@@ -250,9 +270,9 @@ class BTDevice:
 
     @property
     def proximity(self) -> str:
-        # rssi >= -85 → 'dentro'
-        # rssi >= -95 → 'cerca'
-        # rssi <  -95 → 'fuera'
+        # rssi >= -85 → 'cerca'            (dentro del aula)
+        # rssi >= -95 → 'dentro del aula'  (pasillo o adyacente)
+        # rssi <  -95 → 'fuera'            (lejos del perímetro)
 ```
 
 ---
@@ -279,76 +299,22 @@ aparecen en pantalla si cumplen **ambas** condiciones simultáneamente:
    Los dispositivos que dejan de emitir desaparecen de la tabla pasados 20 s.
    Si vuelven a emitir, reaparecen automáticamente.
 
-### Implementación
+---
 
-El filtro se aplica en `main()` al obtener la lista para mostrar:
+## Modelo de proximidad Bluetooth
 
-```python
-ahora = time.time()
-devs  = [
-    d for d in scanner.devices
-    if (d.name or d.manufacturer_id is not None or d.uuids)
-    and (ahora - d.last_seen) <= 20
-]
-```
-
-El caché interno (`_seen`) no se modifica: todos los dispositivos siguen
-almacenados y actualizando su `last_seen` y `rssi` aunque no sean visibles.
+| Zona | RSSI | Significado |
+|------|------|-------------|
+| `cerca` | ≥ -85 dBm | El dispositivo está dentro del aula |
+| `dentro del aula` | ≥ -95 dBm | Pasillo inmediato o aula adyacente |
+| `fuera` | < -95 dBm | Lejos del perímetro |
 
 ---
 
-## Debug integrado
-
-El scanner en su versión actual escribe un log detallado en `/tmp/bt_debug.log`
-con timestamp relativo al arranque. Útil para analizar el comportamiento del
-firmware.
-
-```bash
-# En otra terminal mientras corre el scanner:
-tail -f /tmp/bt_debug.log
-
-# Buscar eventos concretos:
-grep "INQUIRY_COMPLETE\|INQUIRY_RESULT\|EXTENDED" /tmp/bt_debug.log
-grep "EVENT  code=" /tmp/bt_debug.log | sort | uniq -c
-```
-
-La pantalla muestra en tiempo real:
-- Estado del hilo de captura (VIVO / MUERTO)
-- Contadores: eventos totales, BLE adv, Inq results, Inq complete, OSErrors
-- Tiempo desde el último evento recibido y su código
-- Edad de cada dispositivo en segundos (`[Xs]`)
-
----
-
-## Ejecución
-
-```bash
-sudo python3 bluetoothPrueba.py
-```
-
-Requiere root para abrir sockets HCI RAW. Para con Ctrl+C y muestra el resumen
-final de dispositivos detectados.
-
----
-
-## Archivos relacionados
-
-| Archivo | Descripción |
-|---------|-------------|
-| `bluetoothPrueba.py` | Scanner activo, versión con debug completo |
-| `bluetooth.py` | Versión anterior con doble socket (BLE + Inquiry separados). Sirve como referencia de arquitectura alternativa que sí recibe `INQUIRY_COMPLETE` |
-
----
-
----
-
-# Módulo Wi-Fi — `wifi_capture.py`
+# 2. Scanner Wi-Fi — `wifi_capture.py`
 
 Scanner 802.11 en modo monitor para detección de dispositivos inalámbricos durante exámenes.  
 Hardware: Raspberry Pi 5 · Alfa AWUS036ACHM (MT7612U) en `wlan1` · modo monitor
-
-> **Restricción legal (igual que Bluetooth):** Solo captura pasiva. No se inyectan frames,
-> no se interfiere con ninguna señal. La interfaz solo escucha.
 
 ---
 
@@ -382,8 +348,9 @@ información útil para identificar dispositivos y saturarían el procesado.
 
 ## Preparación del adaptador
 
-La interfaz `wlan1` debe estar en modo monitor antes de ejecutar el script.
-El script no cambia el modo por sí solo (requeriría también bajar/subir la interfaz):
+La interfaz `wlan1` debe estar en modo monitor antes de ejecutar el scanner.
+En producción esto lo hace la API automáticamente al recibir `POST /api/start`.
+Para pruebas manuales:
 
 ```bash
 sudo ip link set wlan1 down
@@ -611,6 +578,13 @@ Una interfaz 802.11 en modo monitor solo escucha **un canal a la vez**. Sin hopp
 solo se detectan dispositivos en el canal inicial. En la primera prueba sin hopping
 solo aparecieron dispositivos en los canales 1 y 2.
 
+### Por qué solo 2.4 GHz
+
+- Los Probe Requests (el frame más revelador) se envían siempre en 2.4 GHz independientemente del modo del dispositivo.
+- Con 13 canales el ciclo completo dura 2.6 s; añadir los 21 canales 5 GHz lo sube a 6.8 s, reduciendo la probabilidad de captura por canal.
+- Los canales DFS de 5 GHz son silenciados silenciosamente por el driver MT7612U sin lanzar error.
+- Las señales 2.4 GHz tienen mejor penetración de paredes, relevante en entornos de aula.
+
 ### Implementación
 
 Un hilo dedicado (`wifi-hop`) cicla por todos los canales mediante `itertools.cycle`.
@@ -636,13 +610,6 @@ while self._running.is_set() and time.monotonic() < deadline:
 
 ```python
 _CHANNELS_2GHZ = list(range(1, 14))    # 13 canales, normativa europea
-_CHANNELS_5GHZ = [
-    36, 40, 44, 48,              # UNII-1  (sin DFS, preferidos)
-    52, 56, 60, 64,              # UNII-2  (DFS — el driver puede rechazarlos)
-    100, 104, 108, 112, 116,     # UNII-2E (DFS)
-    132, 136, 140,
-    149, 153, 157, 161, 165,     # UNII-3
-]
 ```
 
 Con `hop_interval = 0.20 s` (defecto) un barrido completo de 2.4 GHz dura 2.6 s.
@@ -675,9 +642,9 @@ class WifiDevice:
 
     @property
     def proximity(self) -> str:
-        # rssi >= -85 dBm → 'dentro'   (dentro del aula)
-        # rssi >= -95 dBm → 'cerca'    (pasillo o adyacente)
-        # rssi <  -95 dBm → 'fuera'    (lejos del perímetro)
+        # rssi >= -85 dBm → 'cerca'           (dentro del aula)
+        # rssi >= -95 dBm → 'dentro del aula' (pasillo o adyacente)
+        # rssi <  -95 dBm → 'fuera'           (lejos del perímetro)
         # rssi is None    → 'desconocido'
 ```
 
@@ -721,14 +688,14 @@ cliente sino una técnica del firmware del router.
 
 ---
 
-## Modelo de proximidad
+## Modelo de proximidad Wi-Fi
 
 Igual que en Bluetooth, se usan tres zonas calibradas para aula estándar:
 
 | Zona | RSSI | Significado |
 |------|------|-------------|
-| `dentro` | ≥ -85 dBm | El dispositivo está dentro del aula |
-| `cerca` | ≥ -95 dBm | Pasillo inmediato o aula adyacente |
+| `cerca` | ≥ -85 dBm | El dispositivo está dentro del aula |
+| `dentro del aula` | ≥ -95 dBm | Pasillo inmediato o aula adyacente |
 | `fuera` | < -95 dBm | Lejos del perímetro |
 
 ---
@@ -744,35 +711,561 @@ WifiScanner(
 )
 ```
 
-- **`hop_interval`**: reducirlo (ej. 0.10 s) mejora la cobertura temporal pero puede
-  perder frames cortos como ACKs. 0.20 s es el equilibrio razonable para Probe Requests
-  (que se retransmiten varias veces).
-- **`scan_5ghz`**: activarlo sube el ciclo de 13 a 34 canales (barrido completo ≈ 6.8 s).
-  Útil si se sospecha del uso de adaptadores 5 GHz (cámaras espía, dongles modernos).
+---
+
+# 3. API REST — `web/api.py`
+
+La API REST es la capa de comunicación entre los scanners Python y la aplicación
+móvil Flutter. Se ejecuta como servicio systemd y arranca automáticamente con la Pi.
 
 ---
 
-## Ejecución
+## Tecnología
 
-```bash
-# 1. Poner wlan1 en modo monitor
-sudo ip link set wlan1 down
-sudo iw dev wlan1 set type monitor
-sudo ip link set wlan1 up
+- **Flask** (Python): servidor HTTP ligero, sin dependencias pesadas
+- **Puerto**: 5000 sobre `0.0.0.0` (todas las interfaces)
+- **Formato**: JSON en todos los endpoints
+- **Concurrencia**: threading.Lock para acceso seguro a los scanners desde múltiples peticiones
 
-# 2. Ejecutar el scanner
-sudo python3 scanner/wifi_capture.py
+---
+
+## Endpoints
+
+### `POST /api/start`
+
+Pone `wlan1` en modo monitor y arranca `BluetoothScanner` + `WifiScanner`.
+
+**Idempotente:** si ya estaba escaneando, devuelve `ok: true` sin relanzar los scanners
+(evita el error "ya está escaneando" que se producía al abrir la app con la Pi ya activa).
+
+```json
+// Respuesta OK (nueva sesión)
+{ "ok": true }
+
+// Respuesta OK (ya estaba activo)
+{ "ok": true, "msg": "Ya estaba escaneando" }
+
+// Error: no se pudo poner wlan1 en monitor
+{ "ok": false, "msg": "No se pudo poner wlan1 en modo monitor" }  // HTTP 500
 ```
 
-Requiere root para abrir el socket `AF_PACKET RAW`. Para con Ctrl+C e imprime
-el resumen final de todos los dispositivos detectados durante la sesión.
+Secuencia interna:
+1. `ip link set wlan1 down`
+2. `iw dev wlan1 set type monitor`
+3. `ip link set wlan1 up`
+4. Instanciar y arrancar `BluetoothScanner()` y `WifiScanner()`
 
 ---
 
-## Archivos relacionados (Wi-Fi)
+### `POST /api/stop`
 
-| Archivo | Descripción |
-|---------|-------------|
-| `scanner/wifi_capture.py` | Scanner Wi-Fi 802.11 en modo monitor con channel hopping |
-| `scanner/bluetooth.py` | Scanner Bluetooth BLE + Clásico (HCI RAW) |
-| `scanner/DESARROLLO.md` | Este documento |
+Para los scanners y restaura `wlan1` a modo managed.
+
+**Idempotente:** si ya estaba parado, devuelve `ok: true`.
+
+```json
+{ "ok": true }
+```
+
+Secuencia interna:
+1. `bt_scanner.stop()` + `wifi_scanner.stop()`
+2. `ip link set wlan1 down`
+3. `iw dev wlan1 set type managed`
+4. `ip link set wlan1 up`
+
+---
+
+### `GET /api/status`
+
+Estado actual del sistema. La app lo consulta al arrancar para sincronizarse con la Pi.
+
+```json
+{
+  "scanning": true,
+  "uptime": 142,
+  "current_channel": 7,
+  "wifi":      { "total": 12, "active": 5 },
+  "bluetooth": { "total": 8,  "active": 3 }
+}
+```
+
+- `uptime`: segundos desde que se llamó a `/api/start`
+- `current_channel`: canal 2.4 GHz en el que está sintonizado `wlan1` en este momento
+- `active`: dispositivos vistos en los últimos 20 s
+- `total`: todos los dispositivos de la sesión
+
+---
+
+### `GET /api/devices`
+
+Dispositivos **activos** (vistos en los últimos 20 s). La app lo llama cada 3 s para
+actualizar el sonar en tiempo real.
+
+```json
+{
+  "wifi": [
+    {
+      "mac": "AA:BB:CC:DD:EE:FF",
+      "ssid": "MiMovil",
+      "rssi": -62,
+      "channel": 6,
+      "frequency": 2437,
+      "frame_type": "PROBE_REQ",
+      "manufacturer": "Apple",
+      "proximity": "cerca",
+      "first_seen": 1719700000,
+      "last_seen": 1719700045,
+      "seconds_ago": 2
+    }
+  ],
+  "bluetooth": [
+    {
+      "mac": "11:22:33:44:55:66",
+      "name": "AirPods Pro",
+      "rssi": -75,
+      "bt_type": "BLE",
+      "addr_type": "public",
+      "manufacturer_id": 76,
+      "uuids": [],
+      "proximity": "dentro del aula",
+      "first_seen": 1719700010,
+      "last_seen": 1719700044,
+      "seconds_ago": 3
+    }
+  ]
+}
+```
+
+Los resultados están ordenados por RSSI descendente (señal más fuerte primero).
+
+**Filtro Bluetooth adicional:** solo se incluyen dispositivos que tengan al menos
+`name`, `manufacturer_id` o `uuids` — descarta paquetes MAC+RSSI vacíos.
+
+---
+
+### `GET /api/history`
+
+Todos los dispositivos detectados en la sesión **sin filtro de tiempo**. La app lo
+llama al pulsar "Parar" para construir la pantalla de historial.
+
+```json
+{
+  "wifi": [ ... ],
+  "bluetooth": [ ... ],
+  "session_duration": 847
+}
+```
+
+- `session_duration`: duración total de la sesión en segundos
+
+---
+
+### `GET /api/devices/wifi` y `GET /api/devices/bluetooth`
+
+Subconjuntos individuales. Misma estructura que el array correspondiente de `/api/devices`.
+Disponibles para consultas específicas.
+
+---
+
+## Gestión del modo monitor
+
+La API gestiona el ciclo de vida del adaptador `wlan1` mediante `subprocess`:
+
+```python
+def _set_monitor_mode() -> bool:
+    subprocess.run(['ip',  'link', 'set',  _IFACE, 'down'],         check=True, ...)
+    subprocess.run(['iw',  'dev',  _IFACE, 'set', 'type', 'monitor'], check=True, ...)
+    subprocess.run(['ip',  'link', 'set',  _IFACE, 'up'],           check=True, ...)
+
+def _set_managed_mode() -> None:
+    subprocess.run(['ip',  'link', 'set',  _IFACE, 'down'], ...)
+    subprocess.run(['iw',  'dev',  _IFACE, 'set', 'type', 'managed'], ...)
+    subprocess.run(['ip',  'link', 'set',  _IFACE, 'up'], ...)
+```
+
+El uso de `subprocess` aquí es **solo para gestión del driver** (operaciones `iw`/`ip`),
+nunca para parseo de paquetes — cumple la restricción técnica del proyecto.
+
+---
+
+## Arranque y dependencias
+
+```python
+if __name__ == '__main__':
+    if os.geteuid() != 0:
+        sys.exit(1)   # requiere root para sockets RAW y gestión de interfaces
+
+    hotspot_ip = os.popen("ip addr show wlan0 | awk '/inet /{print $2}' | cut -d/ -f1").read().strip()
+    print(f'  Hotspot (móvil) → http://{hotspot_ip}:5000')
+
+    app.run(host='0.0.0.0', port=5000, debug=False)
+```
+
+Al arrancar, la API imprime la IP del hotspot (`wlan0`) para confirmar que la red
+está activa. Los scanners arrancan en reposo — la app móvil es la que lanza el escaneo.
+
+---
+
+# 4. Aplicación móvil Flutter
+
+Aplicación Android desarrollada en Flutter/Dart. Se conecta a la API de la Pi por HTTP
+y muestra los dispositivos detectados en un sonar animado.
+
+---
+
+## Arquitectura general
+
+```
+lib/main.dart  (fichero único, ~700 líneas)
+│
+├── DetectorApp           MaterialApp (tema oscuro, semilla verde)
+│
+├── Modelos de datos
+│   ├── WifiDevice        Parseo JSON de /api/devices wifi[]
+│   └── BtDevice          Parseo JSON de /api/devices bluetooth[]
+│
+├── Utilidades globales
+│   ├── _zonas            Orden de zonas: cerca → dentro del aula → fuera
+│   ├── _colorZona()      Color por zona (rojo / naranja / gris)
+│   ├── _iconoZona()      Icono por zona
+│   └── _formatTime()     Timestamp Unix → "HH:MM:SS"
+│
+├── HomePage              Pantalla principal
+│   ├── Campo IP          Dirección de la Pi (por defecto 10.42.0.1)
+│   ├── Botón Iniciar/Parar
+│   ├── Barra de estado   Canal WiFi + contadores activos
+│   └── SonarView         Vista del radar (visible solo cuando escanea)
+│
+├── SonarView             Radar animado
+│   ├── AnimationController  Giro continuo cada 4 s
+│   ├── SonarPainter      CustomPainter con el dibujo del radar
+│   └── Burbujas          WifiBubble / BtBubble posicionadas sobre el canvas
+│
+├── Hojas de detalle (bottom sheets)
+│   ├── WifiDetailSheet   Detalles completos de un dispositivo Wi-Fi
+│   └── BtDetailSheet     Detalles completos de un dispositivo Bluetooth
+│
+└── HistoryScreen         Pantalla de historial al parar el escaneo
+    ├── Estadísticas       Duración, totales Wi-Fi + BT
+    ├── HistoryZoneSection  Sección por zona (cerca / dentro del aula / fuera)
+    ├── WifiHistoryCard    Tarjeta de dispositivo Wi-Fi en historial
+    └── BtHistoryCard      Tarjeta de dispositivo Bluetooth en historial
+```
+
+---
+
+## Dependencias
+
+```yaml
+# pubspec.yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.x     # peticiones HTTP a la API REST
+```
+
+Solo se añade el paquete `http`. Todo el resto (animaciones, pintura, JSON, layout)
+usa el SDK estándar de Flutter.
+
+---
+
+## Comunicación con la API
+
+### Configuración de red
+
+El móvil se conecta a la red Wi-Fi "DetectorFraude" creada por la Pi (hotspot en `wlan0`).
+La Pi siempre tiene la misma IP: `10.42.0.1`. La app usa esa IP por defecto y permite
+cambiarla si se conecta desde otra red.
+
+### Flujo de inicio
+
+```
+1. App abre → _syncStatus() via addPostFrameCallback
+   GET /api/status → si scanning=true, la app entra en modo activo sin llamar /api/start
+                   → si scanning=false, muestra pantalla vacía
+
+2. Docente pulsa "Iniciar"
+   POST /api/start → { ok: true }
+   → Timer.periodic(3s) → GET /api/devices → setState con nuevos dispositivos
+
+3. Docente pulsa "Parar"
+   Timer cancela
+   POST /api/stop
+   GET /api/history → navegar a HistoryScreen
+```
+
+La sincronización al abrir (`_syncStatus`) evita el error "ya está escaneando" que
+ocurría cuando la Pi llevaba tiempo activa y la app llamaba a `/api/start` de nuevo.
+
+### Polling cada 3 segundos
+
+```dart
+_timer = Timer.periodic(const Duration(seconds: 3), (_) => _fetchDevices());
+
+Future<void> _fetchDevices() async {
+  final response = await http.get(Uri.parse('http://$_ip:5000/api/devices'));
+  final data = jsonDecode(response.body);
+  setState(() {
+    _wifiDevices = (data['wifi'] as List).map((j) => WifiDevice.fromJson(j)).toList();
+    _btDevices   = (data['bluetooth'] as List).map((j) => BtDevice.fromJson(j)).toList();
+  });
+}
+```
+
+---
+
+## Sonar — SonarView y SonarPainter
+
+### AnimationController
+
+```dart
+_controller = AnimationController(
+  vsync: this,
+  duration: const Duration(seconds: 4),
+)..repeat();
+```
+
+El valor de la animación va de 0.0 a 1.0 cada 4 segundos. En cada frame,
+`_controller.value * 2π` da el ángulo de barrido en radianes. El `CustomPainter`
+se reconstruye en cada frame gracias a `AnimatedBuilder`.
+
+### SonarPainter — elementos dibujados
+
+1. **Fondo negro** — `canvas.drawCircle` con `clipPath` circular para recortar todo lo que salga fuera.
+2. **Líneas de cuadrícula** — cuatro líneas diagonales cruzadas (eje X, eje Y, ±45°).
+3. **Tres anillos de zona** con etiqueta:
+   - `cerca` → radio 28% del radio total → color rojo
+   - `dentro del aula` → radio 57% → color naranja
+   - `fuera` → radio 82% → color gris
+4. **Estela del barrido** — 8 arcos consecutivos de 5° cada uno con opacidad decreciente,
+   dibujados como sectores circulares (`canvas.drawArc`) justo detrás de la línea de barrido.
+5. **Línea de barrido** — línea verde desde el centro hasta el borde, en la posición actual.
+6. **Punto central** — círculo verde pequeño en el origen.
+7. **Borde exterior** — círculo verde con trazo fino.
+
+### Posicionamiento determinista de dispositivos
+
+Para evitar que las burbujas salten de posición cuando llegan nuevos dispositivos,
+el ángulo de cada MAC es determinista:
+
+```dart
+double _angleForMac(String mac) {
+  // Toma los últimos 8 dígitos hex de la MAC, los convierte a entero
+  // y los mapea a [0, 2π]
+  final hex = mac.replaceAll(':', '').substring(4);  // últimos 8 chars hex
+  final value = int.parse(hex, radix: 16);
+  return (value % 360) * (pi / 180);
+}
+```
+
+El radio depende de la zona:
+
+```dart
+double _radiusForZone(String zone) => switch (zone) {
+  'cerca'           => maxRadius * 0.28,
+  'dentro del aula' => maxRadius * 0.57,
+  _                 => maxRadius * 0.82,   // fuera
+};
+```
+
+Cada burbuja se posiciona con `Positioned` calculando `(x, y)` a partir del ángulo
+y el radio de su zona, centrado en el sonar.
+
+### Burbuja de dispositivo
+
+`WifiBubble` y `BtBubble` son círculos de 52×52 px con:
+- Borde coloreado según zona (rojo / naranja / gris)
+- Icono WiFi o Bluetooth
+- Etiqueta corta del tipo de frame o dispositivo
+
+Al tocar una burbuja se muestra un `showModalBottomSheet` con todos los detalles
+del dispositivo: MAC, RSSI, zona, fabricante, timestamps, segundos desde última detección.
+
+---
+
+## Pantalla de historial
+
+Al pulsar "Parar", la app llama a `GET /api/history` y navega a `HistoryScreen`.
+
+La pantalla muestra:
+- Estadísticas de sesión: duración, total Wi-Fi detectados, total BT detectados
+- Dispositivos agrupados por zona (cerca → dentro del aula → fuera)
+- Cada dispositivo en una tarjeta con sus datos completos
+- Las zonas vacías (sin dispositivos) se ocultan automáticamente
+
+---
+
+# 5. Despliegue e integración del sistema
+
+Esta sección documenta cómo preparar la Raspberry Pi para que el sistema funcione de
+forma totalmente autónoma (sin intervención manual tras el arranque).
+
+---
+
+## Requisitos previos
+
+- Raspberry Pi 5 con Raspberry Pi OS Bookworm 64-bit
+- Adaptador Wi-Fi USB MT7612U conectado (aparece como `wlan1`)
+- Python 3 + Flask instalado: `sudo pip3 install flask`
+- Paquetes del sistema: `iw`, `NetworkManager` (incluidos en Raspberry Pi OS)
+
+---
+
+## Paso 1 — Configurar el hotspot (una sola vez)
+
+El script `ap_setup.sh` crea la red Wi-Fi "DetectorFraude" en `wlan0` (el Wi-Fi integrado
+de la Pi) y marca `wlan1` como no gestionada por NetworkManager para que el scanner
+pueda controlarla libremente.
+
+```bash
+sudo ./ap_setup.sh
+```
+
+Internamente usa `nmcli` para crear una conexión de tipo hotspot:
+
+```bash
+nmcli device wifi hotspot \
+    ifname wlan0 \
+    ssid DetectorFraude \
+    password "detector1234" \
+    con-name DetectorFraude-AP
+
+# Marcar wlan1 como unmanaged para que NetworkManager no interfiera
+nmcli device set wlan1 managed no
+```
+
+El hotspot se configura con `autoconnect yes`, de modo que arranca automáticamente
+en cada reinicio sin ningún comando adicional.
+
+**IP fija del hotspot:** `10.42.0.1`  
+**Red asignada a los clientes:** `10.42.0.0/24`
+
+Este paso solo hay que ejecutarlo una vez. Si hay que reinstalar la Pi desde cero,
+ejecutarlo de nuevo.
+
+---
+
+## Paso 2 — Instalar el servicio systemd (una sola vez)
+
+El script `service_setup.sh` instala `detector-fraude.service` como servicio systemd
+para que la API REST arranque automáticamente con la Pi.
+
+```bash
+sudo ./service_setup.sh
+```
+
+Internamente:
+```bash
+cp detector-fraude.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable detector-fraude    # arranque automático en boot
+systemctl restart detector-fraude   # arranque inmediato
+```
+
+Al finalizar muestra el estado del servicio para confirmar que está activo.
+
+---
+
+## Unidad systemd — `detector-fraude.service`
+
+```ini
+[Unit]
+Description=Detector Fraude Académico — API REST
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/raspi831/TFG-Detector
+ExecStart=/usr/bin/python3 /home/raspi831/TFG-Detector/web/api.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Puntos clave:
+- `After=network-online.target NetworkManager.service` — garantiza que el hotspot
+  ya está activo antes de lanzar la API (la IP `10.42.0.1` ya existe en `wlan0`).
+- `User=root` — necesario para abrir sockets RAW (AF_BLUETOOTH, AF_PACKET) y para
+  ejecutar `iw`/`ip` sin sudo.
+- `Restart=on-failure` con `RestartSec=5` — si la API cae por cualquier motivo,
+  el sistema la relanza automáticamente tras 5 segundos.
+- Los logs van al journal del sistema y se pueden consultar con:
+  ```bash
+  sudo journalctl -u detector-fraude -f
+  ```
+
+---
+
+## Comandos de mantenimiento
+
+```bash
+# Ver estado del servicio
+sudo systemctl status detector-fraude
+
+# Reiniciar tras cambios en el código Python
+sudo systemctl restart detector-fraude
+
+# Ver logs en tiempo real
+sudo journalctl -u detector-fraude -f
+
+# Parar el servicio manualmente
+sudo systemctl stop detector-fraude
+
+# Cambiar modo wlan1 manualmente (para depuración)
+sudo ./wlan1.sh monitor    # pone wlan1 en modo monitor
+sudo ./wlan1.sh managed    # restaura modo managed
+```
+
+---
+
+## Flujo completo de uso
+
+```
+Pi arranca
+  ├─ NetworkManager arranca el hotspot "DetectorFraude" en wlan0 (10.42.0.1)
+  └─ systemd arranca detector-fraude.service → API disponible en :5000
+
+Docente conecta el móvil a la red "DetectorFraude"
+  └─ Abre la app Flutter
+
+App abre
+  └─ GET /api/status → sincroniza estado con la Pi
+
+Docente pulsa "Iniciar"
+  ├─ POST /api/start → wlan1 pasa a modo monitor, BluetoothScanner + WifiScanner arrancan
+  └─ App: Timer cada 3 s → GET /api/devices → sonar actualizado en tiempo real
+
+Examen transcurre
+  └─ Dispositivos aparecen como burbujas en el sonar, posicionados por zona de señal
+
+Docente pulsa "Parar"
+  ├─ POST /api/stop → scanners se detienen, wlan1 vuelve a modo managed
+  ├─ GET /api/history → historial completo de la sesión
+  └─ App: navega a HistoryScreen con todos los dispositivos agrupados por zona
+```
+
+---
+
+## Archivos del proyecto
+
+| Archivo | Función | ¿Es imprescindible? |
+|---------|---------|---------------------|
+| `scanner/bluetooth.py` | BluetoothScanner HCI RAW | Sí |
+| `scanner/wifi_capture.py` | WifiScanner AF_PACKET | Sí |
+| `scanner/__init__.py` | Hace `scanner` importable | Sí |
+| `web/api.py` | API REST Flask | Sí |
+| `web/__init__.py` | Hace `web` importable | Sí |
+| `detector-fraude.service` | Unidad systemd | Sí |
+| `ap_setup.sh` | Configura hotspot wlan0 | Primera instalación |
+| `service_setup.sh` | Instala servicio systemd | Primera instalación |
+| `wlan1.sh` | Cambio manual de modo wlan1 | Depuración |
+| `main.py` | Interfaz de consola (versión antigua) | No |
+| `core/__init__.py` | Carpeta vacía sin uso | No |
+| `diag_radiotap.py` | Diagnóstico RadioTap | No |
+| `scanner/DESARROLLO.md` | Este documento | No (documentación) |

@@ -8,7 +8,6 @@ La interfaz wlan1 debe estar en modo monitor antes de ejecutar el script.
 """
 
 import itertools
-import os
 import queue
 import socket
 import struct
@@ -39,7 +38,7 @@ SUBTYPE_BEACON     = 0x08   # Beacon               — AP anunciando su red peri
 SUBTYPE_AUTH       = 0x0B   # Authentication       — inicio del handshake de autenticación
 SUBTYPE_DEAUTH     = 0x0C   # Deauthentication     — cierre de sesión forzado
 
-# Mapa subtype → nombre legible para mostrar en pantalla
+# Mapa subtype
 SUBTYPE_NAMES = {
     SUBTYPE_ASSOC_REQ:  'ASSOC_REQ',
     SUBTYPE_ASSOC_RESP: 'ASSOC_RESP',
@@ -95,7 +94,7 @@ _OUI_FILE_PATHS = (
 
 # Tabla de reserva mínima para cuando no hay fichero IEEE disponible.
 # Clave: 6 hex chars sin separadores, mayúsculas (primeros 3 bytes del MAC).
-# Cubre solo las marcas más frecuentes en un aula universitaria española.
+
 _OUI_FALLBACK: dict = {
     # Apple — docenas de OUIs; estos cubren iPhones y MacBooks recientes
     '000393': 'Apple', '000A95': 'Apple', '001124': 'Apple', '001451': 'Apple',
@@ -204,16 +203,6 @@ _RT_FIELDS = (
     (17, 1, 1),   # Data Retries
 )
 
-# Códigos de escape ANSI para colorear la salida en terminal
-RED    = '\033[91m'   # rojo    → dentro del aula (RSSI >= -85)
-YELLOW = '\033[93m'   # amarillo → cerca          (RSSI >= -95)
-WHITE  = '\033[97m'   # blanco  → fuera            (RSSI <  -95)
-CYAN   = '\033[96m'   # cian    → cabecera de tabla
-GREEN  = '\033[92m'   # verde   → estado hilo vivo
-RESET  = '\033[0m'    # resetea atributos
-BOLD   = '\033[1m'    # negrita
-CLEAR  = '\033[2J\033[H'   # limpia pantalla y mueve cursor al origen
-
 # Nombre de la interfaz en modo monitor
 MONITOR_IFACE = 'wlan1'
 
@@ -221,12 +210,11 @@ MONITOR_IFACE = 'wlan1'
 ETH_P_ALL = 0x0003
 
 # ── Channel hopping ────────────────────────────────────────────
-# Canales 2.4 GHz (normativa europea: 1-13)
+# Canales 2.4 GHz
 _CHANNELS_2GHZ: list = list(range(1, 14))
 
 # Tiempo de permanencia en cada canal antes de saltar al siguiente (segundos).
 # Con 200 ms: un barrido completo de 2.4 GHz dura 13 × 0.2 = 2.6 s.
-# Reducirlo mejora la cobertura temporal pero puede perder frames cortos.
 HOP_INTERVAL_DEFAULT: float = 0.20
 
 
@@ -410,9 +398,7 @@ def _parse_dot11_header(frame: bytes) -> Optional[dict]:
       [16:22] Addr3           — BSSID u otra dirección según el subtipo
       [22:24] Sequence Control — número de fragmento (4 bits) + número de secuencia (12 bits)
 
-    Nota: Addr4 (6 bytes adicionales) solo existe en frames de datos cuando
-    ToDS=1 AND FromDS=1 simultáneamente (punto a punto dentro del DS).
-    En frames de gestión esto no ocurre, así que siempre son 24 bytes fijos.
+    En frames de gestión siempre son 24 bytes fijos.
 
     Devuelve None si el frame es demasiado corto o no es un frame de gestión.
     """
@@ -511,68 +497,6 @@ def _parse_ies(body: bytes) -> dict:
             result['channel'] = value[0]
 
     return result
-
-
-# ──────────────────────────────────────────────────────────────
-# DISPLAY
-# ──────────────────────────────────────────────────────────────
-
-def _signal_bar(rssi: Optional[int], width: int = 8) -> str:
-    """
-    Genera una barra de señal visual usando bloques Unicode.
-    Rango de referencia: -100 dBm = completamente vacía, -40 dBm = completamente llena.
-    """
-    if rssi is None:
-        return '░' * width
-    normalized = max(0.0, min(1.0, (rssi + 100) / 60.0))
-    filled = round(normalized * width)
-    return '█' * filled + '░' * (width - filled)
-
-
-def _proximity_color(proximity: str) -> str:
-    """Devuelve el código ANSI correspondiente a la zona de proximidad."""
-    return {'cerca': RED, 'dentro del aula': YELLOW, 'fuera': WHITE}.get(proximity, WHITE)
-
-
-def _render_table(devices: list) -> str:
-    """
-    Construye la cadena de texto completa de la tabla de dispositivos Wi-Fi.
-    Ordenada por RSSI descendente (el más cercano aparece primero).
-    """
-    lines = []
-    lines.append(
-        f"{BOLD}{CYAN}{'TIPO':<10} {'MAC':<19} {'RSSI':>5}  {'SEÑAL':<10} "
-        f"{'PROX':<12} {'CH':>4}  {'FABRICANTE / SSID'}{RESET}"
-    )
-    lines.append('─' * 90)
-
-    for dev in sorted(devices, key=lambda d: d.rssi if d.rssi is not None else -999, reverse=True):
-        color    = _proximity_color(dev.proximity)
-        bar      = _signal_bar(dev.rssi)
-        rssi_str = f'{dev.rssi:+4d}' if dev.rssi is not None else '  N/A'
-        ch_str   = str(dev.channel) if dev.channel is not None else '?'
-        age      = int(time.time() - dev.last_seen)
-
-        # Representación del SSID:
-        #   None  → el dispositivo no ha anunciado SSID todavía
-        #   ''    → Probe Request wildcard (busca cualquier red)
-        #   str   → SSID conocido (truncado a 20 caracteres)
-        if dev.ssid is None:
-            ssid_display = ''
-        elif dev.ssid == '':
-            ssid_display = '<wildcard>'
-        else:
-            ssid_display = f'"{dev.ssid[:20]}"'
-
-        fab  = dev.manufacturer[:18] if dev.manufacturer else '?'
-        info = f'{fab:<18}  {ssid_display}' if ssid_display else fab
-
-        lines.append(
-            f"{color}{dev.frame_type:<10} {dev.mac:<19} {rssi_str}  {bar:<10} "
-            f"{dev.proximity:<12} {ch_str:>4}  {info}  [{age}s]{RESET}"
-        )
-
-    return '\n'.join(lines)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -697,12 +621,11 @@ class WifiScanner:
           RadioTap prepended que contiene metadatos de RF (RSSI, canal, tasa, etc.).
           AF_PACKET + SOCK_RAW + ETH_P_ALL recibe todos estos frames tal cual.
 
-        Requiere CAP_NET_RAW (ejecutar como root).
         La interfaz wlan1 debe estar ya en modo monitor antes de llamar a start().
         """
         try:
             # AF_PACKET: opera a nivel de capa de enlace (por debajo de IP)
-            # SOCK_RAW:  recibe el frame completo sin ningún procesado del kernel
+            # SOCK_RAW:  recibe el frame completo
             # htons(ETH_P_ALL): recibe todos los frames independientemente del protocolo
             sock = socket.socket(
                 socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)
@@ -743,12 +666,6 @@ class WifiScanner:
 
         El bucle de dwell usa incrementos de 50 ms en lugar de un único
         time.sleep(hop_interval) para reaccionar rápidamente a stop().
-
-        Por qué el hopper vive en su propio hilo y no en el de captura:
-          El recv() del hilo de captura bloquea hasta que llega un frame
-          (o hasta el timeout de 1s). Si el hopper viviera ahí, el cambio
-          de canal se retrasaría hasta el próximo frame o el timeout, lo
-          que rompería la cadencia de hopping en canales silenciosos.
         """
         for ch in itertools.cycle(_CHANNELS_2GHZ):
             if not self._running.is_set():
@@ -758,8 +675,7 @@ class WifiScanner:
             if ok:
                 self.current_channel = ch
 
-            # Permanece en el canal hop_interval segundos.
-            # El sleep se hace en trozos de 50 ms para poder salir limpiamente
+            # Permanece en el canal hop_interval x segundos.
             # cuando stop() borra _running antes de que expire el intervalo.
             deadline = time.monotonic() + self._hop_interval
             while self._running.is_set() and time.monotonic() < deadline:
@@ -888,78 +804,3 @@ class WifiScanner:
                     self.on_device(dev)
                 except Exception:
                     pass
-
-
-# ──────────────────────────────────────────────────────────────
-# PUNTO DE ENTRADA
-# ──────────────────────────────────────────────────────────────
-
-def main() -> None:
-    """
-    Punto de entrada del script. Requiere root para abrir el socket AF_PACKET RAW.
-    Muestra una tabla que se refresca cada segundo con los dispositivos activos
-    en los últimos 20 segundos, ordenados por RSSI descendente.
-    Para con Ctrl+C e imprime el resumen final.
-    """
-    if os.geteuid() != 0:
-        print('Error: se requiere ejecutar como root (sudo).')
-        sys.exit(1)
-
-    print(f'Interfaz: {MONITOR_IFACE}  (debe estar en modo monitor)')
-    print('Iniciando scanner Wi-Fi 802.11... (Ctrl+C para parar)')
-    time.sleep(0.5)
-
-    scanner    = WifiScanner(iface=MONITOR_IFACE)
-    start_time = time.time()
-    scanner.start()
-
-    try:
-        while True:
-            ahora   = time.time()
-            elapsed = int(ahora - start_time)
-
-            # Solo muestra dispositivos que hayan emitido en los últimos 20 segundos.
-            # Los que llevan más de 20s sin aparecer se ocultan pero siguen en el caché.
-            devs = [d for d in scanner.devices if (ahora - d.last_seen) <= 20]
-
-            ch_now = scanner.current_channel
-            ch_str = f'CH {ch_now}' if ch_now else 'cambiando...'
-
-            print(CLEAR, end='')
-            print(f"{BOLD}=== TFG Detector Fraude Académico — Wi-Fi Scanner 802.11 ==={RESET}")
-            print(
-                f"  Hora: {time.strftime('%H:%M:%S')}  |  Activo: {elapsed}s  |  "
-                f"Dispositivos activos: {len(devs)}  |  "
-                f"Total detectados: {len(scanner.devices)}  |  Ctrl+C para parar"
-            )
-            print(f"  Interfaz: {MONITOR_IFACE}  |  Escuchando: {ch_str}")
-            print()
-
-            if devs:
-                print(_render_table(devs))
-            else:
-                print('  Escuchando frames 802.11 de gestión...')
-
-            time.sleep(1.0)
-
-    except KeyboardInterrupt:
-        pass
-
-    finally:
-        scanner.stop()
-        all_devs = scanner.devices
-        print(
-            f'\n{BOLD}Escaneo finalizado. '
-            f'Total dispositivos detectados: {len(all_devs)}{RESET}'
-        )
-        for dev in sorted(all_devs, key=lambda d: d.rssi or -999, reverse=True):
-            ssid = f'  SSID={dev.ssid!r}' if dev.ssid is not None else ''
-            fab  = f'  {dev.manufacturer}' if dev.manufacturer else ''
-            print(
-                f'  {dev.frame_type:<10} {dev.mac}  RSSI={dev.rssi}  '
-                f'PROX={dev.proximity}  CH={dev.channel}{fab}{ssid}'
-            )
-
-
-if __name__ == '__main__':
-    main()
