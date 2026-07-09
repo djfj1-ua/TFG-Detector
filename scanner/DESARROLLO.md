@@ -320,20 +320,31 @@ Hardware: Raspberry Pi 5 · Alfa AWUS036ACHM (MT7612U) en `wlan1` · modo monito
 
 ## Objetivo
 
-Detectar dispositivos Wi-Fi presentes en el entorno de un aula capturando frames de
-gestión 802.11 sobre la interfaz `wlan1` en modo monitor. Los frames de interés son:
+Detectar dispositivos Wi-Fi que estén **conectados a alguna red y transmitiendo datos**
+durante un examen. Se capturan exclusivamente **frames DATA** (`type=0x02`) con el flag
+`ToDS=1`, es decir, tráfico dirigido de un cliente hacia un AP.
 
-| Subtipo | Nombre | Por qué es relevante |
-|---------|--------|----------------------|
-| 0x04 | Probe Request | Un dispositivo busca redes activamente. Revela presencia aunque no haya AP |
-| 0x08 | Beacon | Un AP (o hotspot móvil) anuncia su red periódicamente |
-| 0x00 | Association Request | Un dispositivo intenta unirse a una red |
-| 0x05 | Probe Response | Respuesta de un AP a un Probe Request |
-| 0x0B | Authentication | Inicio del handshake de autenticación |
-| 0x0C | Deauthentication | Cierre de sesión (útil para detectar ataques o reconexiones) |
+### Por qué solo frames DATA
 
-Los frames de datos (`type=0x02`) y control (`type=0x01`) se descartan: no aportan
-información útil para identificar dispositivos y saturarían el procesado.
+Los frames de gestión (Beacon, Probe Request, etc.) revelan tanto APs como dispositivos
+cliente mezclados, lo que puede llevar a confusión en la interfaz: un docente no necesita
+ver los routers del edificio, sino los smartphones de los alumnos. Capturando únicamente
+frames DATA con `ToDS=1` se garantiza que el transmisor (`addr2`) es siempre un dispositivo
+cliente, nunca un AP.
+
+### Flags ToDS y FromDS
+
+El segundo byte del Frame Control contiene dos flags que identifican la dirección del tráfico:
+
+| ToDS | FromDS | Significado | addr2 |
+|------|--------|-------------|-------|
+| 1 | 0 | Cliente → AP | MAC del cliente ← **se captura** |
+| 0 | 1 | AP → Cliente | BSSID del AP ← se descarta |
+| 0 | 0 | IBSS (ad-hoc) | MAC origen |
+| 1 | 1 | WDS (mesh) | MAC AP transmisor |
+
+Solo se procesa `ToDS=1, FromDS=0`: el único caso donde `addr2` identifica un dispositivo
+cliente transmitiendo activamente hacia la infraestructura.
 
 ---
 
@@ -456,117 +467,23 @@ el inicio de los campos.
 
 ## Parseo cabecera MAC 802.11
 
-La cabecera de un Management Frame siempre tiene 24 bytes fijos:
+La cabecera 802.11 tiene 24 bytes fijos. Para frames DATA solo se necesitan
+el Frame Control y `addr2`:
 
 ```
 [0:2]   Frame Control:
-          byte 0 — bits 0-1: Protocol Version (00)
-                   bits 2-3: Type    (00=Mgmt, 01=Ctrl, 10=Data)
-                   bits 4-7: Subtype (04=Probe Req, 08=Beacon, etc.)
-          byte 1 — bit 6: Protected Frame (cuerpo cifrado con MFP)
+          byte 0 — bits 2-3: Type (0x02 = Data)
+          byte 1 — bit 0: ToDS  (1 = cliente→AP)
+                   bit 1: FromDS (1 = AP→cliente)
 [2:4]   Duration/ID
 [4:10]  Addr1 — Destination
-[10:16] Addr2 — Source (transmisor) ← identificador del dispositivo
+[10:16] Addr2 — Transmisor ← MAC del dispositivo cliente
 [16:22] Addr3 — BSSID
 [22:24] Sequence Control
 ```
 
-Tras los 24 bytes fijos, cada subtipo tiene un bloque de **campos fijos propios**
-antes de que empiecen los Information Elements:
-
-| Subtipo | Nombre | Campos fijos | Bytes |
-|---------|--------|--------------|-------|
-| 0x00 | ASSOC_REQ | Capability + Listen Interval | 4 |
-| 0x01 | ASSOC_RESP | Capability + Status Code + Assoc ID | 6 |
-| 0x04 | PROBE_REQ | (ninguno) | 0 |
-| 0x05 | PROBE_RESP | Timestamp + Beacon Interval + Capability | 12 |
-| 0x08 | BEACON | Timestamp + Beacon Interval + Capability | 12 |
-| 0x0B | AUTH | Algorithm + Auth Seq + Status Code | 6 |
-| 0x0C | DEAUTH | Reason Code | 2 |
-
-Por tanto, el offset real al inicio de los IEs es:
-
-```python
-body_offset = 24 + _FIXED_FIELDS_SIZE.get(subtype, 0)
-```
-
----
-
-## Bug crítico encontrado durante el desarrollo: `body_offset` incorrecto
-
-### Síntoma
-
-Los Beacons siempre mostraban `ssid=''` (wildcard) en lugar del SSID real del AP.
-Las redes con nombre aparecían como si estuvieran buscando cualquier red.
-
-### Causa
-
-`body_offset` estaba hardcodeado a 24 para todos los subtipos. En un Beacon,
-el bloque de 12 bytes de campos fijos empieza en el byte 24:
-
-```
-bytes 24-31: Timestamp (8 bytes, u64) — primeros bytes: 0x00 0x00 …
-```
-
-El parseo de IEs con `body_offset = 24` leía el campo Timestamp como si fuera
-el primer IE:
-- `tag = 0x00` → `IE_SSID`
-- `length = 0x00` → longitud cero = **wildcard SSID**
-
-El resultado era que cualquier Beacon era clasificado como wildcard probe.
-
-### Fix
-
-Añadir `_FIXED_FIELDS_SIZE` y calcular el offset real:
-
-```python
-_FIXED_FIELDS_SIZE = {
-    0x00: 4, 0x01: 6, 0x04: 0, 0x05: 12, 0x08: 12, 0x0B: 6, 0x0C: 2
-}
-body_offset = 24 + _FIXED_FIELDS_SIZE.get(subtype, 0)
-```
-
-Descubierto al construir frames de prueba sintéticos antes de probar en hardware real.
-
----
-
-## Parseo Information Elements (IEs)
-
-Los IEs siguen el formato TLV, idéntico a los AD structures de Bluetooth:
-
-```
-[0]        Tag Number  — tipo del elemento
-[1]        Tag Length  — bytes de valor (sin incluir los 2 bytes de cabecera)
-[2:2+len]  Value
-```
-
-IEs procesados:
-
-| Tag | Nombre | Uso |
-|-----|--------|-----|
-| `0x00` | SSID | Nombre de la red. `length=0` → wildcard (el dispositivo acepta cualquier red) |
-| `0x03` | DS Parameter Set | Canal en el que opera el AP (1 byte). Más preciso que el canal del RadioTap |
-| `0x30` | RSN | Presence → WPA2 o WPA3 activo |
-| `0xDD` | Vendor Specific | Si OUI = `00:50:F2` + tipo `0x01` → WPA1 (anterior a RSN) |
-
-### SSID wildcard vs SSID ausente
-
-```
-ssid = ''    → IE_SSID presente con length=0 (Probe Request sin destino concreto)
-ssid = None  → IE_SSID no está en el frame
-ssid = str   → SSID conocido
-```
-
-### Canal IE_DS_PARAM vs canal RadioTap
-
-El canal del RadioTap refleja en qué canal estaba sintonizado el receptor en el
-momento de la captura (puede diferir del canal real del AP si la interfaz cambió
-de canal justo antes). El `IE_DS_PARAM` contiene el canal en el que el AP opera
-realmente. Se usa `IE_DS_PARAM` cuando está disponible, con RadioTap como fallback:
-
-```python
-channel = ies.get('channel') or rt.get('channel')
-```
+Los frames DATA no tienen Information Elements ni campos fijos adicionales tras
+la cabecera — el cuerpo es el payload cifrado, que no se lee.
 
 ---
 
@@ -580,8 +497,8 @@ solo aparecieron dispositivos en los canales 1 y 2.
 
 ### Por qué solo 2.4 GHz
 
-- Los Probe Requests (el frame más revelador) se envían siempre en 2.4 GHz independientemente del modo del dispositivo.
-- Con 13 canales el ciclo completo dura 2.6 s; añadir los 21 canales 5 GHz lo sube a 6.8 s, reduciendo la probabilidad de captura por canal.
+- La mayoría de redes domésticas y móviles operan en 2.4 GHz, que es la banda que usarán los alumnos en un examen.
+- Con 13 canales el ciclo completo dura 2.6 s; añadir los 21 canales 5 GHz lo sube a 6.8 s, reduciendo el tiempo por canal y la probabilidad de capturar frames DATA (que son bursty y de corta duración).
 - Los canales DFS de 5 GHz son silenciados silenciosamente por el driver MT7612U sin lanzar error.
 - Las señales 2.4 GHz tienen mejor penetración de paredes, relevante en entornos de aula.
 
@@ -1145,6 +1062,103 @@ ejecutarlo de nuevo.
 
 ---
 
+## Captive portal — por qué hace falta y cómo funciona
+
+### El sistema no necesita Internet para nada
+
+Ningún componente (scanners, API, app) hace ninguna llamada a Internet. Los scanners
+usan sockets RAW locales, la API solo usa `subprocess`/`os.popen` para comandos del
+sistema (`ip`, `iw`), y la app solo habla con `10.42.0.1:5000` por la red local del
+hotspot. El AP y la API arrancan solos al encender la Pi sin depender de nada externo.
+
+### El problema: el móvil decide por su cuenta
+
+El hotspot se crea con `nmcli device wifi hotspot`, que por defecto configura
+`ipv4.method=shared` — esto hace NAT automático hacia la interfaz con ruta a
+Internet (si la Pi tiene Ethernet conectado, los clientes del hotspot reciben
+Internet de verdad; si no, no).
+
+Esto importa porque Android e iOS comprueban, nada más conectarse a una red Wi-Fi,
+si esa red tiene salida real a Internet. Si detectan que no la tiene, muchos
+terminales **desvían el tráfico de las apps a datos móviles** aunque el teléfono
+siga "conectado" visualmente al hotspot. Como `10.42.0.1` es una IP privada solo
+alcanzable por esa Wi-Fi, si el tráfico se va por datos móviles la app deja de
+poder hablar con la API — el síntoma es "no se puede conectar con la Raspberry"
+aunque el hotspot funcione perfectamente y se vea en la lista de redes.
+
+Con Ethernet conectado el problema no se nota (hay Internet real detrás del
+hotspot, el móvil confía en la red), lo que hace que el fallo parezca depender
+del cable cuando en realidad depende de qué decide el sistema operativo del móvil.
+
+### La solución: hacer creer al móvil que sí hay Internet
+
+Se implementan las dos piezas que Android/iOS esperan al comprobar conectividad:
+
+**1. DNS — `/etc/NetworkManager/dnsmasq-shared.d/captive.conf`**
+
+El hotspot usa internamente `dnsmasq` (se puede comprobar con
+`ps aux | grep dnsmasq`), arrancado por NetworkManager con
+`--conf-dir=/etc/NetworkManager/dnsmasq-shared.d` — un punto de extensión oficial
+para conexiones en modo `shared`. `ap_setup.sh` crea ahí este fichero:
+
+```
+address=/connectivitycheck.gstatic.com/10.42.0.1
+address=/connectivitycheck.android.com/10.42.0.1
+address=/clients3.google.com/10.42.0.1
+address=/clients.l.google.com/10.42.0.1
+address=/captive.apple.com/10.42.0.1
+address=/www.apple.com/10.42.0.1
+```
+
+Así, cuando el móvil pregunta por esos dominios (los que usan los sistemas de
+comprobación de conectividad de Google/Android y de Apple), `dnsmasq` responde
+que la dirección es la propia Pi (`10.42.0.1`) en vez de fallar por falta de DNS
+upstream.
+
+**2. HTTP — segundo listener en `web/api.py` (puerto 80)**
+
+Esas comprobaciones de conectividad van por el puerto 80 estándar, no por el 5000
+donde corre la API. `web/api.py` define una segunda app Flask (`captive_app`) que
+se lanza en un hilo daemon aparte (`_run_captive_portal`) cuando arranca el script:
+
+```python
+@captive_app.route('/generate_204')
+@captive_app.route('/gen_204')
+def _android_connectivity_check():
+    return '', 204   # Android espera 204 sin cuerpo
+
+
+@captive_app.route('/hotspot-detect.html')
+@captive_app.route('/library/test/success.html')
+def _apple_connectivity_check():
+    html = '<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'
+    return html, 200, {'Content-Type': 'text/html'}   # iOS/macOS esperan este HTML exacto
+```
+
+### Resultado
+
+```
+Móvil se conecta al hotspot
+  → consulta connectivitycheck.gstatic.com (Android) o captive.apple.com (iOS)
+  → dnsmasq de la Pi resuelve ese dominio a 10.42.0.1 (en vez de fallar)
+  → el móvil pide /generate_204 o /hotspot-detect.html a esa IP, puerto 80
+  → captive_app responde exactamente lo que el móvil espera
+  → el móvil concluye "esta red tiene Internet" y mantiene TODO el tráfico
+    (incluida la app del detector) por Wi-Fi, sin desviar a datos móviles
+```
+
+Esto hace que el comportamiento sea **siempre el mismo**, con o sin Ethernet
+conectado a la Pi, sin tener que tocar la configuración del móvil (modo avión,
+desactivar cambio automático a datos móviles, etc.) cada vez que se usa el sistema.
+
+**Nota:** la lista de dominios cubre los casos más comunes (Android stock/Google
+e iOS), pero no todos los fabricantes usan exactamente los mismos dominios de
+comprobación (algunos Android personalizados por el fabricante pueden usar otros).
+Si algún terminal concreto sigue desviando tráfico, hay que añadir su dominio de
+comprobación al fichero `captive.conf`.
+
+---
+
 ## Paso 2 — Instalar el servicio systemd (una sola vez)
 
 El script `service_setup.sh` instala `detector-fraude.service` como servicio systemd
@@ -1265,7 +1279,4 @@ Docente pulsa "Parar"
 | `ap_setup.sh` | Configura hotspot wlan0 | Primera instalación |
 | `service_setup.sh` | Instala servicio systemd | Primera instalación |
 | `wlan1.sh` | Cambio manual de modo wlan1 | Depuración |
-| `main.py` | Interfaz de consola (versión antigua) | No |
-| `core/__init__.py` | Carpeta vacía sin uso | No |
-| `diag_radiotap.py` | Diagnóstico RadioTap | No |
 | `scanner/DESARROLLO.md` | Este documento | No (documentación) |

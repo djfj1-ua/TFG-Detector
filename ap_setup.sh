@@ -13,7 +13,7 @@
 set -e
 
 SSID="${1:-DetectorFraude}"
-PASS="${2:-fraude2024}"
+PASS="${2:-fraude2026}"
 IFACE_AP="wlan0"
 IFACE_SCAN="wlan1"
 
@@ -38,14 +38,32 @@ cat > "$CONF_FILE" <<EOF
 [keyfile]
 unmanaged-devices=interface-name:$IFACE_SCAN
 EOF
-echo "[1/4] wlan1 marcada como no gestionada por NetworkManager"
+echo "[1/5] wlan1 marcada como no gestionada por NetworkManager"
 
 # ── Paso 2: Reiniciar NetworkManager para aplicar el cambio ──
 systemctl restart NetworkManager
 sleep 2
-echo "[2/4] NetworkManager reiniciado"
+echo "[2/5] NetworkManager reiniciado"
 
-# ── Paso 3: Crear el hotspot ──────────────────────────────────
+# ── Paso 3: Captive portal — el móvil no debe creer que falta Internet ──
+# El hotspot no necesita dar Internet real (el sistema no lo usa para
+# nada), pero si el móvil detecta "sin Internet" en esta red puede
+# desviar el tráfico de la app a datos móviles. Se redirige el DNS de
+# los dominios que Android/iOS consultan para comprobar conectividad
+# hacia la propia Pi; web/api.py responde esas peticiones en el :80.
+DNSMASQ_DIR="/etc/NetworkManager/dnsmasq-shared.d"
+mkdir -p "$DNSMASQ_DIR"
+cat > "$DNSMASQ_DIR/captive.conf" <<EOF
+address=/connectivitycheck.gstatic.com/10.42.0.1
+address=/connectivitycheck.android.com/10.42.0.1
+address=/clients3.google.com/10.42.0.1
+address=/clients.l.google.com/10.42.0.1
+address=/captive.apple.com/10.42.0.1
+address=/www.apple.com/10.42.0.1
+EOF
+echo "[3/5] DNS del captive portal configurado"
+
+# ── Paso 4: Crear el hotspot ──────────────────────────────────
 # Si ya existe un perfil "Hotspot", lo borramos antes
 nmcli connection delete "Hotspot" 2>/dev/null || true
 
@@ -54,14 +72,14 @@ nmcli dev wifi hotspot \
     ssid "$SSID" \
     password "$PASS"
 
-echo "[3/4] Hotspot creado y activo"
+echo "[4/5] Hotspot creado y activo"
 
-# ── Paso 4: Autoconexión al arrancar ─────────────────────────
+# ── Paso 5: Autoconexión al arrancar ─────────────────────────
 nmcli connection modify "Hotspot" \
     connection.autoconnect yes \
     connection.autoconnect-priority 100
 
-echo "[4/4] Autoconexión configurada"
+echo "[5/5] Autoconexión configurada"
 
 # ── Resultado ─────────────────────────────────────────────────
 echo ""

@@ -7,13 +7,11 @@ Se gestiona como servicio systemd (detector-fraude.service) para arrancar
 automáticamente con la Raspberry Pi. No requiere intervención manual.
 
 Endpoints:
-  POST /api/start              — pone wlan1 en monitor y arranca los scanners
-  POST /api/stop               — detiene los scanners y restaura wlan1 a managed
-  GET  /api/status             — estado del sistema y contadores
-  GET  /api/devices            — todos los dispositivos activos (WiFi + BT)
-  GET  /api/devices/wifi       — solo dispositivos Wi-Fi activos
-  GET  /api/devices/bluetooth  — solo dispositivos Bluetooth activos
-  GET  /api/history            — todos los dispositivos de la sesión (sin filtro)
+  POST /api/start    — pone wlan1 en monitor y arranca los scanners
+  POST /api/stop     — detiene los scanners y restaura wlan1 a managed
+  GET  /api/status   — estado del sistema y contadores
+  GET  /api/devices  — todos los dispositivos activos (WiFi + BT)
+  GET  /api/history  — todos los dispositivos de la sesión (sin filtro)
 """
 
 import os
@@ -117,26 +115,20 @@ def _wifi_to_dict(dev) -> dict:
 
 def _bt_to_dict(dev) -> dict:
     return {
-        'mac':             dev.mac,
-        'name':            dev.name,
-        'rssi':            dev.rssi,
-        'bt_type':         dev.bt_type,
-        'addr_type':       dev.addr_type,
-        'manufacturer_id': dev.manufacturer_id,
-        'uuids':           dev.uuids,
-        'proximity':       dev.proximity,
-        'first_seen':      int(dev.first_seen),
-        'last_seen':       int(dev.last_seen),
-        'seconds_ago':     int(time.time() - dev.last_seen),
+        'mac':        dev.mac,
+        'name':       dev.name,
+        'rssi':       dev.rssi,
+        'bt_type':    dev.bt_type,
+        'proximity':  dev.proximity,
+        'first_seen': int(dev.first_seen),
+        'last_seen':  int(dev.last_seen),
+        'seconds_ago': int(time.time() - dev.last_seen),
     }
 
 
 def _is_active(dev) -> bool:
     return (time.time() - dev.last_seen) <= _ACTIVE_WINDOW
 
-
-def _bt_has_info(dev) -> bool:
-    return bool(dev.name or dev.manufacturer_id is not None or dev.uuids)
 
 
 # ── Consulta ───────────────────────────────────────────────────
@@ -155,7 +147,7 @@ def status():
         wifi_total  = len(all_wifi)
         wifi_active = sum(1 for d in all_wifi if _is_active(d))
         bt_total    = len(all_bt)
-        bt_active   = sum(1 for d in all_bt if _is_active(d) and _bt_has_info(d))
+        bt_active   = sum(1 for d in all_bt if _is_active(d))
         channel     = wf.current_channel
 
     return jsonify({
@@ -178,33 +170,12 @@ def devices():
         return jsonify({'wifi': [], 'bluetooth': []})
 
     wifi = [_wifi_to_dict(d) for d in wf.devices if _is_active(d)]
-    bt_  = [_bt_to_dict(d)   for d in bt.devices if _is_active(d) and _bt_has_info(d)]
+    bt_  = [_bt_to_dict(d)   for d in bt.devices if _is_active(d)]
     return jsonify({
-        'wifi':      sorted(wifi, key=lambda d: d['rssi'] or -999, reverse=True),
-        'bluetooth': sorted(bt_,  key=lambda d: d['rssi'] or -999, reverse=True),
+        'wifi':      sorted(wifi, key=lambda d: d['rssi'], reverse=True),
+        'bluetooth': sorted(bt_,  key=lambda d: d['rssi'], reverse=True),
     })
 
-
-@app.route('/api/devices/wifi')
-def devices_wifi():
-    with _lock:
-        scanning = _scanning
-        wf = _wifi_scanner
-    if not scanning:
-        return jsonify([])
-    devs = [_wifi_to_dict(d) for d in wf.devices if _is_active(d)]
-    return jsonify(sorted(devs, key=lambda d: d['rssi'] or -999, reverse=True))
-
-
-@app.route('/api/devices/bluetooth')
-def devices_bluetooth():
-    with _lock:
-        scanning = _scanning
-        bt = _bt_scanner
-    if not scanning:
-        return jsonify([])
-    devs = [_bt_to_dict(d) for d in bt.devices if _is_active(d) and _bt_has_info(d)]
-    return jsonify(sorted(devs, key=lambda d: d['rssi'] or -999, reverse=True))
 
 
 @app.route('/api/history')
@@ -219,12 +190,52 @@ def history():
         return jsonify({'wifi': [], 'bluetooth': [], 'session_duration': 0})
 
     wifi = [_wifi_to_dict(d) for d in wf.devices]
-    bt_  = [_bt_to_dict(d)   for d in bt.devices if _bt_has_info(d)]
+    bt_  = [_bt_to_dict(d)   for d in bt.devices]
     return jsonify({
-        'wifi':             sorted(wifi, key=lambda d: d['rssi'] or -999, reverse=True),
-        'bluetooth':        sorted(bt_,  key=lambda d: d['rssi'] or -999, reverse=True),
+        'wifi':             sorted(wifi, key=lambda d: d['rssi'], reverse=True),
+        'bluetooth':        sorted(bt_,  key=lambda d: d['rssi'], reverse=True),
         'session_duration': duration,
     })
+
+
+# ── Captive portal ─────────────────────────────────────────────
+# El hotspot de la Pi no tiene por qué dar Internet real a los móviles
+# (el sistema no lo necesita para nada). Pero si un móvil detecta que
+# una red Wi-Fi "no tiene Internet", muchos terminan desviando el
+# tráfico de las apps a datos móviles aunque sigan conectados a esa
+# red — rompiendo la conexión con esta API aunque el hotspot funcione
+# perfectamente. Estas rutas responden exactamente lo que Android/iOS
+# esperan en su comprobación de conectividad, para que el móvil crea
+# que la red sí tiene Internet y mantenga el tráfico por Wi-Fi.
+#
+# El DNS de los dominios que el móvil consulta (connectivitycheck.
+# gstatic.com, captive.apple.com, etc.) se redirige a la propia Pi
+# mediante /etc/NetworkManager/dnsmasq-shared.d/captive.conf mientras
+# que estas rutas, en el puerto 80, dan la respuesta que se espera.
+captive_app = Flask(__name__ + '_captive')
+
+
+@captive_app.route('/generate_204')
+@captive_app.route('/gen_204')
+def _android_connectivity_check():
+    """Android espera HTTP 204 sin cuerpo para considerar que hay Internet."""
+    return '', 204
+
+
+@captive_app.route('/hotspot-detect.html')
+@captive_app.route('/library/test/success.html')
+def _apple_connectivity_check():
+    """iOS/macOS esperan este HTML exacto para considerar que hay Internet."""
+    html = '<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'
+    return html, 200, {'Content-Type': 'text/html'}
+
+
+def _run_captive_portal() -> None:
+    """Lanza el servidor del captive portal en el puerto 80 (hilo daemon)."""
+    try:
+        captive_app.run(host='0.0.0.0', port=80, debug=False)
+    except OSError as e:
+        print(f'No se pudo iniciar el captive portal en :80: {e}', file=sys.stderr)
 
 
 # ── Arranque ───────────────────────────────────────────────────
@@ -239,5 +250,7 @@ if __name__ == '__main__':
     if hotspot_ip:
         print(f'  Hotspot (móvil) → http://{hotspot_ip}:5000')
     print(f'  Scanners en reposo. La app arranca el escaneo.')
+
+    threading.Thread(target=_run_captive_portal, daemon=True).start()
 
     app.run(host='0.0.0.0', port=5000, debug=False)

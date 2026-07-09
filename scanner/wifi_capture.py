@@ -24,56 +24,8 @@ from typing import Callable, Optional
 # ──────────────────────────────────────────────────────────────
 
 # Tipos de frame 802.11 (bits 2-3 del byte 0 del Frame Control)
-FRAME_TYPE_MGMT = 0x00   # Gestión: Beacon, Probe, Auth, Assoc
-FRAME_TYPE_CTRL = 0x01   # Control: ACK, RTS, CTS  (se ignoran)
-FRAME_TYPE_DATA = 0x02   # Data: tráfico de usuario (se ignoran)
-
-# Subtipos de frames de gestión (bits 4-7 del byte 0 del Frame Control)
-# Solo los relevantes para detección de fraude académico
-SUBTYPE_ASSOC_REQ  = 0x00   # Association Request  — dispositivo intentando unirse a una red
-SUBTYPE_ASSOC_RESP = 0x01   # Association Response — AP aceptando o rechazando la asociación
-SUBTYPE_PROBE_REQ  = 0x04   # Probe Request        — dispositivo buscando redes activamente
-SUBTYPE_PROBE_RESP = 0x05   # Probe Response       — AP respondiendo a un Probe Request
-SUBTYPE_BEACON     = 0x08   # Beacon               — AP anunciando su red periódicamente
-SUBTYPE_AUTH       = 0x0B   # Authentication       — inicio del handshake de autenticación
-SUBTYPE_DEAUTH     = 0x0C   # Deauthentication     — cierre de sesión forzado
-
-# Mapa subtype
-SUBTYPE_NAMES = {
-    SUBTYPE_ASSOC_REQ:  'ASSOC_REQ',
-    SUBTYPE_ASSOC_RESP: 'ASSOC_RESP',
-    SUBTYPE_PROBE_REQ:  'PROBE_REQ',
-    SUBTYPE_PROBE_RESP: 'PROBE_RESP',
-    SUBTYPE_BEACON:     'BEACON',
-    SUBTYPE_AUTH:       'AUTH',
-    SUBTYPE_DEAUTH:     'DEAUTH',
-}
-
-# Bytes de campos fijos que preceden a los IEs en cada subtipo de Management frame.
-# Los 24 bytes de cabecera MAC son comunes a todos; estos son los bytes ADICIONALES
-# específicos de cada subtipo antes de que empiecen los Information Elements.
-#
-# Subtype → fixed fields size (bytes)
-#   ASSOC_REQ  (0x00): Capability(2) + Listen Interval(2)               = 4
-#   ASSOC_RESP (0x01): Capability(2) + Status Code(2) + Assoc ID(2)     = 6
-#   PROBE_REQ  (0x04): sin campos fijos, IEs empiezan de inmediato       = 0
-#   PROBE_RESP (0x05): Timestamp(8) + Beacon Interval(2) + Capability(2) = 12
-#   BEACON     (0x08): Timestamp(8) + Beacon Interval(2) + Capability(2) = 12
-#   AUTH       (0x0B): Algorithm(2) + Auth Seq(2) + Status Code(2)      = 6
-#   DEAUTH     (0x0C): Reason Code(2)                                    = 2
-_FIXED_FIELDS_SIZE = {
-    SUBTYPE_ASSOC_REQ:  4,
-    SUBTYPE_ASSOC_RESP: 6,
-    SUBTYPE_PROBE_REQ:  0,
-    SUBTYPE_PROBE_RESP: 12,
-    SUBTYPE_BEACON:     12,
-    SUBTYPE_AUTH:       6,
-    SUBTYPE_DEAUTH:     2,
-}
-
-# Tags de Information Elements (IEs) — formato TLV compartido por todos los Mgmt frames
-IE_SSID     = 0x00   # SSID del AP o de la red buscada (Probe Request wildcard si len=0)
-IE_DS_PARAM = 0x03   # DS Parameter Set: canal actual del AP (1 byte sin signo)
+# Solo se procesan frames DATA (type=0x02). Gestión y Control se descartan.
+FRAME_TYPE_DATA = 0x02   # Data: tráfico de usuario
 
 
 # ──────────────────────────────────────────────────────────────
@@ -373,130 +325,43 @@ def _is_unicast_mac(raw6: bytes) -> bool:
 
 def _parse_dot11_header(frame: bytes) -> Optional[dict]:
     """
-    Parsea la cabecera MAC 802.11 de un frame de gestión.
+    Parsea la cabecera MAC 802.11 y devuelve los campos necesarios para
+    identificar el transmisor de un frame DATA.
 
-    Estructura del Frame Control (2 bytes, little-endian):
+    Estructura del Frame Control (2 bytes):
       Byte 0:
-        bits 0-1 — Protocol Version (siempre 00 en 802.11)
-        bits 2-3 — Type:    00=Management, 01=Control, 10=Data, 11=Extension
-        bits 4-7 — Subtype: identifica el subtipo dentro del tipo
-      Byte 1 (Frame Control Flags):
-        bit 0 — To DS         (frame hacia el Distribution System)
-        bit 1 — From DS       (frame desde el DS)
-        bit 2 — More Fragments
-        bit 3 — Retry         (retransmisión)
-        bit 4 — Power Management
-        bit 5 — More Data
-        bit 6 — Protected Frame (cuerpo del frame cifrado con WEP/WPA/MFP)
-        bit 7 — Order / HTC present
+        bits 2-3 — Type:    0x02 = Data
+      Byte 1 (flags):
+        bit 0 — To DS   (1 = frame hacia el AP)
+        bit 1 — From DS (1 = frame desde el AP → se descarta en _process_frame)
 
-    Cabecera fija de un Management Frame (24 bytes):
-      [0:2]   Frame Control   — tipo, subtipo y flags
-      [2:4]   Duration/ID     — µs reservados para el canal durante la transacción
-      [4:10]  Addr1           — Destination (receptor del frame)
-      [10:16] Addr2           — Source (transmisor del frame) ← identificador del dispositivo
-      [16:22] Addr3           — BSSID u otra dirección según el subtipo
-      [22:24] Sequence Control — número de fragmento (4 bits) + número de secuencia (12 bits)
+    Cabecera fija 802.11 (24 bytes):
+      [4:10]  Addr2 — transmisor del frame ← MAC del dispositivo cliente
+      [10:16] Addr2 es siempre el transmisor independientemente de ToDS/FromDS
 
-    En frames de gestión siempre son 24 bytes fijos.
-
-    Devuelve None si el frame es demasiado corto o no es un frame de gestión.
+    Devuelve None si el frame es demasiado corto o no es un frame DATA.
     """
     if len(frame) < 24:
         return None
 
-    fc0 = frame[0]   # primer byte del Frame Control
-    fc1 = frame[1]   # segundo byte del Frame Control (flags)
+    fc0 = frame[0]
+    fc1 = frame[1]
 
-    # Extrae type y subtype del primer byte del Frame Control
     fc_type = (fc0 >> 2) & 0x03   # bits 2-3: tipo de frame
-    subtype  = (fc0 >> 4) & 0x0F  # bits 4-7: subtipo
+    from_ds = (fc1 >> 1) & 0x01   # bit 1: frame procedente del AP
 
-    # Solo procesamos frames de gestión
-    if fc_type != FRAME_TYPE_MGMT:
+    if fc_type != FRAME_TYPE_DATA:
         return None
 
-    # Extrae las tres direcciones MAC de la cabecera fija
-    addr1_raw = frame[4:10]    # dirección destino (receptor)
-    addr2_raw = frame[10:16]   # dirección origen  (transmisor) ← clave para identificar
-    addr3_raw = frame[16:22]   # BSSID u otra dirección
-
-    # Los IEs empiezan en el byte 24 (cabecera MAC fija) más los campos fijos
-    # propios del subtipo (timestamp, capabilities, reason code, etc.).
-    # Sin este ajuste, _parse_ies leería basura como si fueran IEs.
-    body_offset = 24 + _FIXED_FIELDS_SIZE.get(subtype, 0)
+    addr2_raw = frame[10:16]   # transmisor del frame ← MAC del dispositivo
 
     return {
-        'subtype':     subtype,
-        'addr1':       _mac_str(addr1_raw),
-        'addr2':       _mac_str(addr2_raw),
-        'addr3':       _mac_str(addr3_raw),
-        'addr2_raw':   addr2_raw,   # bytes crudos para el filtro unicast
-        'body_offset': body_offset,
+        'from_ds':   from_ds,
+        'addr2':     _mac_str(addr2_raw),
+        'addr2_raw': addr2_raw,
     }
 
 
-# ──────────────────────────────────────────────────────────────
-# PARSEO INFORMATION ELEMENTS (IEs)
-# ──────────────────────────────────────────────────────────────
-
-def _parse_ies(body: bytes) -> dict:
-    """
-    Parsea los Information Elements del cuerpo de un frame de gestión 802.11.
-
-    Los IEs utilizan el formato TLV (Type-Length-Value), idéntico en estructura
-    a los AD structures de Bluetooth. Se concatenan directamente uno tras otro.
-
-    Estructura de cada IE:
-      [0]        Tag Number  — tipo del elemento
-      [1]        Tag Length  — bytes de valor que siguen (sin incluir estos 2 bytes)
-      [2:2+len]  Value       — datos del elemento
-
-    IEs procesados:
-      Tag 0x00 (IE_SSID)     — nombre de la red en UTF-8
-                               length=0 → wildcard (Probe Request sin SSID concreto)
-      Tag 0x03 (IE_DS_PARAM) — canal actual del AP (1 byte u8)
-
-    Devuelve:
-      ssid     — nombre de red (str), '' si wildcard, None si no hay IE_SSID
-      channel  — número de canal (int) o None si no hay IE_DS_PARAM
-    """
-    result: dict = {'ssid': None, 'channel': None}
-    i = 0
-
-    while i < len(body):
-        # Cabecera mínima: 2 bytes (tag + length)
-        if i + 2 > len(body):
-            break
-
-        tag    = body[i]
-        length = body[i + 1]
-        i += 2
-
-        # Protección contra IEs con length que excede el buffer restante
-        if i + length > len(body):
-            break
-
-        value = body[i: i + length]
-        i += length
-
-        # ── SSID ──────────────────────────────────────────────
-        if tag == IE_SSID:
-            if length == 0:
-                # Wildcard SSID: el dispositivo busca cualquier red disponible
-                # Se distingue de None (IE_SSID no presente) con cadena vacía ''
-                result['ssid'] = ''
-            else:
-                try:
-                    result['ssid'] = value.decode('utf-8', errors='replace').strip('\x00')
-                except Exception:
-                    pass
-
-        # ── DS Parameter Set — canal ───────────────────────────
-        elif tag == IE_DS_PARAM and length >= 1:
-            result['channel'] = value[0]
-
-    return result
 
 
 # ──────────────────────────────────────────────────────────────
@@ -690,9 +555,9 @@ class WifiScanner:
         Flujo:
           1. Parsea el header RadioTap → RSSI, canal, frecuencia
           2. Avanza al frame 802.11 (offset = header_len, menos FCS si procede)
-          3. Parsea la cabecera 802.11 → descarta si no es Management frame de interés
-          4. Descarta si addr2 no es unicast (evita registrar broadcast/multicast)
-          5. Parsea los IEs → SSID, canal, WPA2
+          3. Descarta si no es frame DATA
+          4. Descarta si from_ds=1 (AP→cliente: el transmisor sería el AP, no un dispositivo)
+          5. Descarta si addr2 no es unicast
           6. Registra o actualiza el dispositivo en el caché
         """
         # Paso 1: RadioTap
@@ -701,41 +566,29 @@ class WifiScanner:
         if header_len >= len(raw):
             return
 
-        # El frame 802.11 empieza tras el header RadioTap
-        # Si el driver dejó el FCS (4 bytes al final), lo eliminamos antes de parsear
         fcs_trim = 4 if rt['fcs_present'] else 0
-        frame_end = len(raw) - fcs_trim
-        frame = raw[header_len: frame_end]
+        frame = raw[header_len: len(raw) - fcs_trim]
 
-        # Paso 2: cabecera 802.11
+        # Paso 2: cabecera 802.11 — descarta todo lo que no sea DATA
         dot11 = _parse_dot11_header(frame)
         if dot11 is None:
-            return   # no es Management frame o demasiado corto
+            return
 
-        subtype = dot11['subtype']
-        if subtype not in SUBTYPE_NAMES:
-            return   # subtipo no relevante para detección de fraude
+        # Paso 3: descarta tráfico AP→cliente (from_ds=1); solo nos interesa cliente→AP
+        if dot11['from_ds'] == 1:
+            return
 
-        # Paso 3: filtro de addr2 (solo transmisores unicast tienen sentido)
+        # Paso 4: solo transmisores unicast
         if not _is_unicast_mac(dot11['addr2_raw']):
             return
 
-        # Paso 4: IEs
-        body_start = dot11['body_offset']
-        ies: dict  = {'ssid': None, 'channel': None}
-        if len(frame) > body_start:
-            ies = _parse_ies(frame[body_start:])
-
-        # Paso 5: el canal del IE_DS_PARAM es más preciso que el del RadioTap
-        channel = ies.get('channel') or rt.get('channel')
-
         report = {
-            'mac':       dot11['addr2'],
-            'ssid':      ies.get('ssid'),
-            'rssi':      rt.get('rssi'),
-            'channel':   channel,
-            'frequency': rt.get('frequency'),
-            'frame_type': SUBTYPE_NAMES[subtype],
+            'mac':        dot11['addr2'],
+            'ssid':       None,
+            'rssi':       rt.get('rssi'),
+            'channel':    rt.get('channel'),
+            'frequency':  rt.get('frequency'),
+            'frame_type': 'DATA',
         }
         self._register_device(report)
 
