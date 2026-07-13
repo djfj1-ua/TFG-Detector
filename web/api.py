@@ -7,11 +7,11 @@ Se gestiona como servicio systemd (detector-fraude.service) para arrancar
 automáticamente con la Raspberry Pi. No requiere intervención manual.
 
 Endpoints:
-  POST /api/start    — pone wlan1 en monitor y arranca los scanners
-  POST /api/stop     — detiene los scanners y restaura wlan1 a managed
-  GET  /api/status   — estado del sistema y contadores
-  GET  /api/devices  — todos los dispositivos activos (WiFi + BT)
-  GET  /api/history  — todos los dispositivos de la sesión (sin filtro)
+  POST /api/start — pone wlan1 en monitor y arranca los scanners
+  POST /api/stop — detiene los scanners y restaura wlan1 a managed
+  GET  /api/status — estado del sistema y contadores
+  GET  /api/devices — todos los dispositivos activos (WiFi + BT)
+  GET  /api/history — todos los dispositivos de la sesión (sin filtro)
 """
 
 import os
@@ -28,35 +28,35 @@ from scanner.wifi_capture import WifiScanner
 
 app = Flask(__name__)
 
-_IFACE       = 'wlan1'
-_ACTIVE_WINDOW = 20.0
-_start_time    = time.time()
-_lock          = threading.Lock()
-_bt_scanner    = None
-_wifi_scanner  = None
-_scanning      = False
+_INTERFAZ = 'wlan1'
+_VENTANA_ACTIVA = 20.0
+_tiempo_inicio = time.time()
+_bloqueo = threading.Lock()
+_escaner_bt = None
+_escaner_wifi = None
+_escaneando = False
 
 
 # ── Gestión del adaptador WiFi ─────────────────────────────────
 
-def _set_monitor_mode() -> bool:
+def _activarModoMonitor() -> bool:
     """Pone wlan1 en modo monitor. Devuelve True si tiene éxito."""
     try:
-        subprocess.run(['ip', 'link', 'set', _IFACE, 'down'], check=True, capture_output=True)
-        subprocess.run(['iw', 'dev', _IFACE, 'set', 'type', 'monitor'], check=True, capture_output=True)
-        subprocess.run(['ip', 'link', 'set', _IFACE, 'up'], check=True, capture_output=True)
+        subprocess.run(['ip', 'link', 'set', _INTERFAZ, 'down'], check=True, capture_output=True)
+        subprocess.run(['iw', 'dev', _INTERFAZ, 'set', 'type', 'monitor'], check=True, capture_output=True)
+        subprocess.run(['ip', 'link', 'set', _INTERFAZ, 'up'], check=True, capture_output=True)
         return True
     except subprocess.CalledProcessError as e:
         print(f'Error al activar modo monitor: {e}', file=sys.stderr)
         return False
 
 
-def _set_managed_mode() -> None:
+def _restaurarModoManaged() -> None:
     """Restaura wlan1 a modo managed."""
     try:
-        subprocess.run(['ip', 'link', 'set', _IFACE, 'down'], capture_output=True)
-        subprocess.run(['iw', 'dev', _IFACE, 'set', 'type', 'managed'], capture_output=True)
-        subprocess.run(['ip', 'link', 'set', _IFACE, 'up'], capture_output=True)
+        subprocess.run(['ip', 'link', 'set', _INTERFAZ, 'down'], capture_output=True)
+        subprocess.run(['iw', 'dev', _INTERFAZ, 'set', 'type', 'managed'], capture_output=True)
+        subprocess.run(['ip', 'link', 'set', _INTERFAZ, 'up'], capture_output=True)
     except Exception:
         pass
 
@@ -64,137 +64,137 @@ def _set_managed_mode() -> None:
 # ── Control ────────────────────────────────────────────────────
 
 @app.route('/api/start', methods=['POST'])
-def start():
-    global _bt_scanner, _wifi_scanner, _scanning, _start_time
-    with _lock:
-        if _scanning:
+def iniciar():
+    global _escaner_bt, _escaner_wifi, _escaneando, _tiempo_inicio
+    with _bloqueo:
+        if _escaneando:
             return jsonify({'ok': True, 'msg': 'Ya estaba escaneando'})
 
-        if not _set_monitor_mode():
-            return jsonify({'ok': False, 'msg': f'No se pudo poner {_IFACE} en modo monitor'}), 500
+        if not _activarModoMonitor():
+            return jsonify({'ok': False, 'msg': f'No se pudo poner {_INTERFAZ} en modo monitor'}), 500
 
-        _bt_scanner   = BluetoothScanner()
-        _wifi_scanner = WifiScanner()
-        _bt_scanner.start()
-        _wifi_scanner.start()
-        _scanning   = True
-        _start_time = time.time()
+        _escaner_bt = BluetoothScanner()
+        _escaner_wifi = WifiScanner()
+        _escaner_bt.start()
+        _escaner_wifi.start()
+        _escaneando = True
+        _tiempo_inicio = time.time()
     return jsonify({'ok': True})
 
 
 @app.route('/api/stop', methods=['POST'])
-def stop():
-    global _bt_scanner, _wifi_scanner, _scanning
-    with _lock:
-        if not _scanning:
+def detener():
+    global _escaner_bt, _escaner_wifi, _escaneando
+    with _bloqueo:
+        if not _escaneando:
             return jsonify({'ok': True, 'msg': 'Ya estaba parado'})
-        _bt_scanner.stop()
-        _wifi_scanner.stop()
-        _scanning = False
-    _set_managed_mode()
+        _escaner_bt.stop()
+        _escaner_wifi.stop()
+        _escaneando = False
+    _restaurarModoManaged()
     return jsonify({'ok': True})
 
 
 # ── Serialización ──────────────────────────────────────────────
 
-def _wifi_to_dict(dev) -> dict:
+def _wifiADict(dev) -> dict:
     return {
-        'mac':          dev.mac,
-        'ssid':         dev.ssid,
-        'rssi':         dev.rssi,
-        'channel':      dev.channel,
-        'frequency':    dev.frequency,
-        'frame_type':   dev.frame_type,
-        'manufacturer': dev.manufacturer,
-        'proximity':    dev.proximity,
-        'first_seen':   int(dev.first_seen),
-        'last_seen':    int(dev.last_seen),
-        'seconds_ago':  int(time.time() - dev.last_seen),
+        'mac': dev.mac,
+        'ssid': dev.ssid,
+        'rssi': dev.rssi,
+        'channel': dev.canal,
+        'frequency': dev.frecuencia,
+        'frame_type': dev.tipo_trama,
+        'manufacturer': dev.fabricante,
+        'proximity': dev.proximidad,
+        'first_seen': int(dev.primera_vez),
+        'last_seen': int(dev.ultima_vez),
+        'seconds_ago': int(time.time() - dev.ultima_vez),
     }
 
 
-def _bt_to_dict(dev) -> dict:
+def _btADict(dev) -> dict:
     return {
-        'mac':        dev.mac,
-        'name':       dev.name,
-        'rssi':       dev.rssi,
-        'bt_type':    dev.bt_type,
-        'proximity':  dev.proximity,
-        'first_seen': int(dev.first_seen),
-        'last_seen':  int(dev.last_seen),
-        'seconds_ago': int(time.time() - dev.last_seen),
+        'mac': dev.mac,
+        'name': dev.nombre,
+        'rssi': dev.rssi,
+        'bt_type': dev.tipo,
+        'proximity': dev.proximidad,
+        'first_seen': int(dev.primera_vez),
+        'last_seen': int(dev.ultima_vez),
+        'seconds_ago': int(time.time() - dev.ultima_vez),
     }
 
 
-def _is_active(dev) -> bool:
-    return (time.time() - dev.last_seen) <= _ACTIVE_WINDOW
-
+def _esta_activo(dev) -> bool:
+    return (time.time() - dev.ultima_vez) <= _VENTANA_ACTIVA
 
 
 # ── Consulta ───────────────────────────────────────────────────
 
 @app.route('/api/status')
-def status():
-    with _lock:
-        scanning = _scanning
-        bt  = _bt_scanner
-        wf  = _wifi_scanner
+def estado():
+    with _bloqueo:
+        escaneando = _escaneando
+        escaner_bt = _escaner_bt
+        escaner_wifi = _escaner_wifi
 
-    wifi_total, wifi_active, bt_total, bt_active, channel = 0, 0, 0, 0, None
-    if scanning:
-        all_wifi    = wf.devices
-        all_bt      = bt.devices
-        wifi_total  = len(all_wifi)
-        wifi_active = sum(1 for d in all_wifi if _is_active(d))
-        bt_total    = len(all_bt)
-        bt_active   = sum(1 for d in all_bt if _is_active(d))
-        channel     = wf.current_channel
+    total_wifi, activos_wifi, total_bt, activos_bt, canal = 0, 0, 0, 0, None
+    if escaneando:
+        todos_wifi = escaner_wifi.devices
+        todos_bt = escaner_bt.devices
+        total_wifi = len(todos_wifi)
+        activos_wifi = sum(1 for d in todos_wifi if _esta_activo(d))
+        total_bt = len(todos_bt)
+        activos_bt = sum(1 for d in todos_bt  if _esta_activo(d))
+        canal = escaner_wifi.canal_actual
 
     return jsonify({
-        'scanning':        scanning,
-        'uptime':          int(time.time() - _start_time),
-        'current_channel': channel,
-        'wifi':      {'total': wifi_total,  'active': wifi_active},
-        'bluetooth': {'total': bt_total,    'active': bt_active},
+        'scanning': escaneando,
+        'uptime': int(time.time() - _tiempo_inicio),
+        'current_channel': canal,
+        'wifi': {'total': total_wifi, 'active': activos_wifi},
+        'bluetooth': {'total': total_bt,   'active': activos_bt},
     })
 
 
 @app.route('/api/devices')
-def devices():
-    with _lock:
-        scanning = _scanning
-        bt  = _bt_scanner
-        wf  = _wifi_scanner
+def dispositivos():
+    with _bloqueo:
+        escaneando = _escaneando
+        escaner_bt = _escaner_bt
+        escaner_wifi = _escaner_wifi
 
-    if not scanning:
+    if not escaneando:
         return jsonify({'wifi': [], 'bluetooth': []})
 
-    wifi = [_wifi_to_dict(d) for d in wf.devices if _is_active(d)]
-    bt_  = [_bt_to_dict(d)   for d in bt.devices if _is_active(d)]
+    disp_wifi = [_wifiADict(d) for d in escaner_wifi.devices if _esta_activo(d)]
+    disp_bt = [_btADict(d)   for d in escaner_bt.devices   if _esta_activo(d)]
+    _rssi = lambda d: d['rssi'] if d['rssi'] is not None else -999
     return jsonify({
-        'wifi':      sorted(wifi, key=lambda d: d['rssi'], reverse=True),
-        'bluetooth': sorted(bt_,  key=lambda d: d['rssi'], reverse=True),
+        'wifi':      sorted(disp_wifi, key=_rssi, reverse=True),
+        'bluetooth': sorted(disp_bt,   key=_rssi, reverse=True),
     })
 
 
-
 @app.route('/api/history')
-def history():
+def historial():
     """Todos los dispositivos vistos en la sesión, sin filtro de tiempo activo."""
-    with _lock:
-        bt       = _bt_scanner
-        wf       = _wifi_scanner
-        duration = int(time.time() - _start_time)
+    with _bloqueo:
+        escaner_bt = _escaner_bt
+        escaner_wifi = _escaner_wifi
+        duracion = int(time.time() - _tiempo_inicio)
 
-    if bt is None or wf is None:
+    if escaner_bt is None or escaner_wifi is None:
         return jsonify({'wifi': [], 'bluetooth': [], 'session_duration': 0})
 
-    wifi = [_wifi_to_dict(d) for d in wf.devices]
-    bt_  = [_bt_to_dict(d)   for d in bt.devices]
+    disp_wifi = [_wifiADict(d) for d in escaner_wifi.devices]
+    disp_bt = [_btADict(d)   for d in escaner_bt.devices]
+    _rssi = lambda d: d['rssi'] if d['rssi'] is not None else -999
     return jsonify({
-        'wifi':             sorted(wifi, key=lambda d: d['rssi'], reverse=True),
-        'bluetooth':        sorted(bt_,  key=lambda d: d['rssi'], reverse=True),
-        'session_duration': duration,
+        'wifi':             sorted(disp_wifi, key=_rssi, reverse=True),
+        'bluetooth':        sorted(disp_bt,   key=_rssi, reverse=True),
+        'session_duration': duracion,
     })
 
 
@@ -212,28 +212,28 @@ def history():
 # gstatic.com, captive.apple.com, etc.) se redirige a la propia Pi
 # mediante /etc/NetworkManager/dnsmasq-shared.d/captive.conf mientras
 # que estas rutas, en el puerto 80, dan la respuesta que se espera.
-captive_app = Flask(__name__ + '_captive')
+app_cautiva = Flask(__name__ + '_cautiva')
 
 
-@captive_app.route('/generate_204')
-@captive_app.route('/gen_204')
-def _android_connectivity_check():
+@app_cautiva.route('/generate_204')
+@app_cautiva.route('/gen_204')
+def _verificacionAndroid():
     """Android espera HTTP 204 sin cuerpo para considerar que hay Internet."""
     return '', 204
 
 
-@captive_app.route('/hotspot-detect.html')
-@captive_app.route('/library/test/success.html')
-def _apple_connectivity_check():
+@app_cautiva.route('/hotspot-detect.html')
+@app_cautiva.route('/library/test/success.html')
+def _verificacionApple():
     """iOS/macOS esperan este HTML exacto para considerar que hay Internet."""
     html = '<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'
     return html, 200, {'Content-Type': 'text/html'}
 
 
-def _run_captive_portal() -> None:
+def _lanzarPortalCautivo() -> None:
     """Lanza el servidor del captive portal en el puerto 80 (hilo daemon)."""
     try:
-        captive_app.run(host='0.0.0.0', port=80, debug=False)
+        app_cautiva.run(host='0.0.0.0', port=80, debug=False)
     except OSError as e:
         print(f'No se pudo iniciar el captive portal en :80: {e}', file=sys.stderr)
 
@@ -245,12 +245,12 @@ if __name__ == '__main__':
         print('Error: se requiere ejecutar como root (sudo).')
         sys.exit(1)
 
-    hotspot_ip = os.popen("ip addr show wlan0 | awk '/inet /{print $2}' | cut -d/ -f1").read().strip()
+    ip_hotspot = os.popen("ip addr show wlan0 | awk '/inet /{print $2}' | cut -d/ -f1").read().strip()
     print(f'API disponible en:')
-    if hotspot_ip:
-        print(f'  Hotspot (móvil) → http://{hotspot_ip}:5000')
+    if ip_hotspot:
+        print(f'  Hotspot (móvil) → http://{ip_hotspot}:5000')
     print(f'  Scanners en reposo. La app arranca el escaneo.')
 
-    threading.Thread(target=_run_captive_portal, daemon=True).start()
+    threading.Thread(target=_lanzarPortalCautivo, daemon=True).start()
 
     app.run(host='0.0.0.0', port=5000, debug=False)
